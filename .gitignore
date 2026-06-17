@@ -1,0 +1,31 @@
+# --- Secrets & credentials ---
+backend/credentials.json
+backend/token.json
+backend/.env
+
+# --- Runtime data ---
+backend/registry.db
+backend/temp/
+
+# --- Python artifacts ---
+backend/__pycache__/
+backend/**/__pycache__/
+backend/*.pyc
+backend/venv/
+backend/.venv/
+
+# --- ML model binaries (large files, download separately) ---
+backend/models/
+*.onnx
+
+# --- Frontend build artifacts ---
+frontend/node_modules/
+frontend/dist/
+
+# --- Internal planning & debug docs (not for public repo) ---
+plans/
+docs/BUGS.md
+
+# --- OS ---
+.DS_Store
+**/.DS_Store
