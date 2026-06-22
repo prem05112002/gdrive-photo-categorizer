@@ -1,7 +1,7 @@
 import threading
 from typing import Callable
 
-from database.models import SessionLocal, Photo, FaceObservation, Person, TripPerson, Trip
+from database.models import SessionLocal, Photo, FaceObservation, Person, TripPerson, Trip, UserCorrection
 from database import crud
 
 _upload_progress: dict[str, dict] = {}
@@ -132,8 +132,12 @@ def build_trip_output(
 
         for pid in named_pids:
             if pid in person_folders:
-                get_or_create_shortcut(service, photo.drive_file_id, fname, person_folders[pid])
+                shortcut_id = get_or_create_shortcut(service, photo.drive_file_id, fname, person_folders[pid])
                 shortcuts += 1
+                session.query(FaceObservation).filter(
+                    FaceObservation.photo_id == photo.id,
+                    FaceObservation.person_id == pid,
+                ).update({"drive_shortcut_id": shortcut_id})
 
         if has_unmatched:
             if misc_id is None:

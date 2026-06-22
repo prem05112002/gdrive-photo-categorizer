@@ -1,7 +1,7 @@
 import uuid
 from pathlib import Path
 from datetime import datetime
-from sqlalchemy import create_engine, Column, String, Boolean, Integer, Float, DateTime, LargeBinary, ForeignKey
+from sqlalchemy import create_engine, Column, String, Boolean, Integer, Float, DateTime, LargeBinary, ForeignKey, Date
 from sqlalchemy.orm import DeclarativeBase, relationship, sessionmaker
 
 _BACKEND_DIR = Path(__file__).parent.parent
@@ -49,8 +49,9 @@ class Trip(Base):
     id = Column(String, primary_key=True, default=_uuid)
     name = Column(String, nullable=False)
     drive_folder_id = Column(String, nullable=False)
-    # created | ingesting | ingested | extracting_faces | faces_extracted | enrolled | classified | uploaded | failed
+    # created | ingesting | ingested | extracting_faces | faces_extracted | enrolled | classified | uploaded | body_detecting | body_detected | failed
     status = Column(String, nullable=False, default="created")
+    timezone = Column(String, default="UTC")
     expected_member_count = Column(Integer)
     output_folder_id = Column(String)
     last_good_status = Column(String)   # last status before any failure; used for retry UX
@@ -111,9 +112,63 @@ class FaceObservation(Base):
     confidence = Column(Float)   # InsightFace det_score (0–1)
     is_stranger = Column(Boolean, default=False)
     face_crop = Column(LargeBinary)  # JPEG bytes of cropped face (256×256)
+    drive_shortcut_id = Column(String)  # Drive shortcut file ID in person's folder (set during upload)
 
     photo = relationship("Photo", back_populates="face_observations")
     person = relationship("Person", back_populates="face_observations")
+
+
+class UserCorrection(Base):
+    __tablename__ = "user_corrections"
+
+    id = Column(String, primary_key=True, default=_uuid)
+    trip_id = Column(String, ForeignKey("trips.id"), nullable=False)
+    face_observation_id = Column(String, ForeignKey("face_observations.id"))
+    old_person_id = Column(String, ForeignKey("persons.id"))
+    new_person_id = Column(String, ForeignKey("persons.id"))
+    correction_type = Column(String)   # reassigned | dismissed | misc_assigned | misc_created
+    status = Column(String, default="pending")  # pending | synced | failed
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class PersonOutfit(Base):
+    __tablename__ = "person_outfits"
+
+    id = Column(String, primary_key=True, default=_uuid)
+    person_id = Column(String, ForeignKey("persons.id"), nullable=False)
+    trip_id = Column(String, ForeignKey("trips.id"), nullable=False)
+    date = Column(String, nullable=False)       # ISO date string (YYYY-MM-DD)
+    hsv_histogram = Column(LargeBinary, nullable=False)  # 32³ float32 histogram bytes
+    photo_count = Column(Integer, default=1)
+    updated_at = Column(DateTime, default=datetime.utcnow)
+
+
+class UnmatchedPerson(Base):
+    __tablename__ = "unmatched_persons"
+
+    id = Column(String, primary_key=True, default=_uuid)
+    photo_id = Column(String, ForeignKey("photos.id"))
+    trip_id = Column(String, ForeignKey("trips.id"), nullable=False)
+    bbox_x = Column(Integer)
+    bbox_y = Column(Integer)
+    bbox_w = Column(Integer)
+    bbox_h = Column(Integer)
+    hsv_histogram = Column(LargeBinary)
+    suggested_person_id = Column(String, ForeignKey("persons.id"))
+    suggestion_confidence = Column(Float)
+    status = Column(String, default="pending_review")   # pending_review | assigned | dismissed
+
+
+class PotentialMisclassification(Base):
+    __tablename__ = "potential_misclassifications"
+
+    id = Column(String, primary_key=True, default=_uuid)
+    face_observation_id = Column(String, ForeignKey("face_observations.id"))
+    trip_id = Column(String, ForeignKey("trips.id"), nullable=False)
+    current_person_id = Column(String, ForeignKey("persons.id"))
+    outfit_suggests_id = Column(String, ForeignKey("persons.id"))
+    outfit_correlation = Column(Float)
+    status = Column(String, default="pending_review")   # pending_review | confirmed | dismissed
 
 
 def init_db():

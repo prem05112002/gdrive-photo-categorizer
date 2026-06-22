@@ -1,4 +1,4 @@
-registry.db
+*.db
 token.json
 credentials.json
 temp/

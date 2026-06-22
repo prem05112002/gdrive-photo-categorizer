@@ -5,6 +5,7 @@ from sqlalchemy.orm import Session
 
 from database.models import get_session, FaceObservation, Photo, Person, PersonEmbedding, TripPerson
 from database import crud
+from enrollment.cluster import cluster_faces
 
 router = APIRouter()
 
@@ -120,3 +121,82 @@ def create_person_from_misc(
     session.commit()
 
     return {"person_id": person.id, "name": person.name}
+
+
+@router.post("/{trip_id}/misc/{face_id}/dismiss")
+def dismiss_misc_face(trip_id: str, face_id: str, session: Session = Depends(get_session)):
+    face = session.query(FaceObservation).filter(FaceObservation.id == face_id).first()
+    if not face:
+        raise HTTPException(404, "Face not found")
+
+    photo = session.query(Photo).filter(Photo.id == face.photo_id).first()
+    if not photo or photo.trip_id != trip_id:
+        raise HTTPException(404, "Face not in this trip")
+
+    if face.person_id:
+        raise HTTPException(409, "Face already assigned to a person")
+
+    face.is_stranger = True
+    session.commit()
+
+    return {"dismissed": True}
+
+
+@router.get("/{trip_id}/misc-clusters")
+def get_misc_clusters(trip_id: str, session: Session = Depends(get_session)):
+    trip = crud.get_trip(session, trip_id)
+    if not trip:
+        raise HTTPException(404, "Trip not found")
+
+    clusters = cluster_faces(session, trip_id)
+    result = []
+    for c in clusters:
+        result.append({
+            "cluster_id": c["cluster_id"],
+            "size": c["size"],
+            "face_ids": c["face_ids"],
+            "representative_crops": [
+                base64.b64encode(crop).decode() for crop in c["representative_crops"]
+            ],
+        })
+    return {"clusters": result, "total_faces": sum(c["size"] for c in clusters)}
+
+
+class BulkAssignPayload(BaseModel):
+    face_ids: list[str]
+    person_id: str
+
+
+@router.post("/{trip_id}/misc-bulk-assign")
+def bulk_assign_misc(trip_id: str, payload: BulkAssignPayload, session: Session = Depends(get_session)):
+    person = session.query(Person).filter(Person.id == payload.person_id).first()
+    if not person:
+        raise HTTPException(404, "Person not found")
+
+    faces = session.query(FaceObservation).filter(FaceObservation.id.in_(payload.face_ids)).all()
+    for face in faces:
+        if face.raw_embedding:
+            session.add(PersonEmbedding(
+                person_id=person.id,
+                embedding=face.raw_embedding,
+                source_photo_id=face.photo_id,
+                quality_score=face.confidence,
+            ))
+        face.person_id = person.id
+    session.commit()
+    return {"assigned": len(faces), "person_id": person.id}
+
+
+class BulkDismissPayload(BaseModel):
+    face_ids: list[str]
+
+
+@router.post("/{trip_id}/misc-bulk-dismiss")
+def bulk_dismiss_misc(trip_id: str, payload: BulkDismissPayload, session: Session = Depends(get_session)):
+    updated = (
+        session.query(FaceObservation)
+        .filter(FaceObservation.id.in_(payload.face_ids))
+        .update({"is_stranger": True}, synchronize_session=False)
+    )
+    session.commit()
+    return {"dismissed": updated}

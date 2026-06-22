@@ -1,12 +1,14 @@
 import base64
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
-from sqlalchemy import func, distinct
+from sqlalchemy import func, distinct, text
 from sqlalchemy.orm import Session
 
 from database.models import get_session, FaceObservation, Photo, Person, PersonEmbedding, TripPerson
 from database import crud
 from enrollment.cluster import cluster_faces
+
+from database.models import PersonOutfit, UnmatchedPerson
 
 router = APIRouter()
 
@@ -48,7 +50,7 @@ def get_clusters(trip_id: str, session: Session = Depends(get_session)):
     trip = crud.get_trip(session, trip_id)
     if not trip:
         raise HTTPException(404, "Trip not found")
-    if trip.status not in ("faces_extracted", "enrolled", "failed"):
+    if trip.status not in ("faces_extracted", "enrolled", "classified", "uploaded", "body_detecting", "body_detected", "failed"):
         raise HTTPException(409, f"Clustering requires status 'faces_extracted', current: '{trip.status}'")
 
     clusters = cluster_faces(session, trip_id)
@@ -145,3 +147,84 @@ def get_coverage(trip_id: str, session: Session = Depends(get_session)):
     ) or 0
 
     return {"named": named, "expected": trip.expected_member_count}
+
+
+@router.get("/{trip_id}/persons")
+def get_enrolled_persons(trip_id: str, session: Session = Depends(get_session)):
+    trip = crud.get_trip(session, trip_id)
+    if not trip:
+        raise HTTPException(404, "Trip not found")
+
+    rows = (
+        session.query(Person, TripPerson)
+        .join(TripPerson, TripPerson.person_id == Person.id)
+        .filter(TripPerson.trip_id == trip_id)
+        .all()
+    )
+
+    result = []
+    for person, _ in rows:
+        face_count = (
+            session.query(func.count(FaceObservation.id))
+            .filter(FaceObservation.person_id == person.id)
+            .scalar()
+        ) or 0
+        thumbnail_b64 = base64.b64encode(person.thumbnail).decode() if person.thumbnail else None
+        result.append({
+            "person_id": person.id,
+            "name": person.name,
+            "face_count": face_count,
+            "thumbnail": thumbnail_b64,
+        })
+
+    result.sort(key=lambda p: p["face_count"], reverse=True)
+    return result
+
+
+@router.delete("/{trip_id}/persons/{person_id}")
+def delete_enrolled_person(trip_id: str, person_id: str, session: Session = Depends(get_session)):
+    trip = crud.get_trip(session, trip_id)
+    if not trip:
+        raise HTTPException(404, "Trip not found")
+
+    tp = session.query(TripPerson).filter(
+        TripPerson.trip_id == trip_id,
+        TripPerson.person_id == person_id,
+    ).first()
+    if not tp:
+        raise HTTPException(404, "Person not enrolled in this trip")
+
+    # Use raw SQL for all deletes — the ORM relationship between Person and TripPerson
+    # (composite PK, no cascade) causes SQLAlchemy to raise AssertionError when using
+    # session.delete() because it tries to null a primary key column.
+
+    # Free face observations scoped to this trip's photos only
+    session.execute(text(
+        "UPDATE face_observations SET person_id = NULL, is_stranger = 0 "
+        "WHERE person_id = :pid AND photo_id IN (SELECT id FROM photos WHERE trip_id = :tid)"
+    ), {"pid": person_id, "tid": trip_id})
+
+    session.execute(text(
+        "DELETE FROM person_outfits WHERE person_id = :pid AND trip_id = :tid"
+    ), {"pid": person_id, "tid": trip_id})
+
+    session.execute(text(
+        "UPDATE unmatched_persons SET suggested_person_id = NULL, suggestion_confidence = NULL "
+        "WHERE suggested_person_id = :pid AND trip_id = :tid"
+    ), {"pid": person_id, "tid": trip_id})
+
+    session.execute(text(
+        "DELETE FROM trip_persons WHERE trip_id = :tid AND person_id = :pid"
+    ), {"pid": person_id, "tid": trip_id})
+
+    # Only delete the global Person record if no other trips reference them
+    other_trips = session.execute(text(
+        "SELECT COUNT(*) FROM trip_persons WHERE person_id = :pid"
+    ), {"pid": person_id}).scalar()
+
+    if other_trips == 0:
+        session.execute(text("DELETE FROM person_embeddings WHERE person_id = :pid"), {"pid": person_id})
+        session.execute(text("DELETE FROM persons WHERE id = :pid"), {"pid": person_id})
+
+    session.commit()
+    return {"deleted": person_id}

@@ -4,7 +4,8 @@ backend/token.json
 backend/.env
 
 # --- Runtime data ---
-backend/registry.db
+backend/*.db
+registry.db
 backend/temp/
 
 # --- Python artifacts ---
@@ -17,6 +18,7 @@ backend/.venv/
 # --- ML model binaries (large files, download separately) ---
 backend/models/
 *.onnx
+*.pt
 
 # --- Frontend build artifacts ---
 frontend/node_modules/
