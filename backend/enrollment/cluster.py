@@ -5,8 +5,8 @@ from sqlalchemy.orm import Session
 from database.models import FaceObservation, Photo
 
 
-def cluster_faces(session: Session, trip_id: str, eps: float = 0.6, min_samples: int = 1) -> list[dict]:
-    """DBSCAN on L2-normalized 512-dim embeddings. eps=0.6 tuned on this dataset, cosine metric."""
+def cluster_faces(session: Session, trip_id: str, eps: float = 0.35, min_samples: int = 1) -> list[dict]:
+    """DBSCAN on L2-normalized 512-dim embeddings. eps=0.35 (cosine distance ≤0.35 → similarity ≥0.65), min_samples=1."""
     rows = (
         session.query(FaceObservation)
         .join(Photo, Photo.id == FaceObservation.photo_id)

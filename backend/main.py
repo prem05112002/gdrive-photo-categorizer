@@ -3,7 +3,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from database.models import init_db
-from api import trips, processing, pipeline, classify, review, persons
+from api import trips, processing, pipeline, classify, review, persons, gallery, sync, body
 from enrollment import router as enrollment_router
 
 
@@ -30,6 +30,11 @@ app.include_router(enrollment_router.router, prefix="/api/enrollment", tags=["en
 app.include_router(classify.router, prefix="/api/classify", tags=["classify"])
 app.include_router(review.router, prefix="/api/review", tags=["review"])
 app.include_router(persons.router, prefix="/api/persons", tags=["persons"])
+app.include_router(gallery.trips_router, prefix="/api/trips", tags=["gallery"])
+app.include_router(gallery.photos_router, prefix="/api/photos", tags=["gallery"])
+app.include_router(sync.trips_router, prefix="/api/trips", tags=["sync"])
+app.include_router(sync.face_obs_router, prefix="/api/face-observations", tags=["sync"])
+app.include_router(body.router, prefix="/api/body", tags=["body"])
 
 
 @app.get("/api/health")

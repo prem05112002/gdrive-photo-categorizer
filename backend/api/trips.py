@@ -1,11 +1,13 @@
+import shutil
 import uuid
+from pathlib import Path
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
-from database.models import Trip, get_session
+from database.models import Trip, TripPerson, UserCorrection, PersonOutfit, UnmatchedPerson, PotentialMisclassification, get_session
 from database.schemas import TripCreate, TripResponse
 from database import crud
-from drive.ingest import extract_folder_id
+from drive.ingest import extract_folder_id, TEMP_DIR
 
 router = APIRouter()
 
@@ -61,5 +63,15 @@ def delete_trip(trip_id: str, session: Session = Depends(get_session)):
     trip = crud.get_trip(session, trip_id)
     if not trip:
         raise HTTPException(status_code=404, detail="Trip not found")
-    session.delete(trip)
+    # Delete FK-linked rows that have no cascade relationship on Trip
+    session.query(UserCorrection).filter(UserCorrection.trip_id == trip_id).delete(synchronize_session=False)
+    session.query(PersonOutfit).filter(PersonOutfit.trip_id == trip_id).delete(synchronize_session=False)
+    session.query(UnmatchedPerson).filter(UnmatchedPerson.trip_id == trip_id).delete(synchronize_session=False)
+    session.query(PotentialMisclassification).filter(PotentialMisclassification.trip_id == trip_id).delete(synchronize_session=False)
+    session.query(TripPerson).filter(TripPerson.trip_id == trip_id).delete(synchronize_session=False)
+    session.delete(trip)  # cascades: Trip → Photo → FaceObservation
     session.commit()
+
+    trip_dir = TEMP_DIR / trip_id
+    if trip_dir.exists():
+        shutil.rmtree(trip_dir)

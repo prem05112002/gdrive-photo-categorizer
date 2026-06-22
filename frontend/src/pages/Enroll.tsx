@@ -1,35 +1,45 @@
 import { useState, useEffect } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
-import { ArrowLeft, CheckCircle, Loader2, X, Users } from 'lucide-react'
-import { api, type GroupPhoto, type FaceCluster } from '../api/client'
+import { Loader2, ChevronLeft, ChevronRight, Trash2 } from 'lucide-react'
+import { api, type GroupPhoto, type FaceCluster, type EnrolledPerson } from '../api/client'
+import { Topbar } from '../components/Topbar'
 
 export function Enroll() {
   const { id } = useParams<{ id: string }>()
   const navigate = useNavigate()
 
-  const [loading, setLoading] = useState(true)
-  const [error, setError] = useState<string | null>(null)
-  const [groupPhotos, setGroupPhotos] = useState<GroupPhoto[]>([])
-  const [clusters, setClusters] = useState<FaceCluster[]>([])
-  const [named, setNamed] = useState(0)
-  const [expected, setExpected] = useState<number | null>(null)
-  const [nameInputs, setNameInputs] = useState<Record<number, string>>({})
-  const [saving, setSaving] = useState<Set<number>>(new Set())
-  const [savedNames, setSavedNames] = useState<Record<number, string>>({})
-  const [dismissed, setDismissed] = useState<Set<number>>(new Set())
+  const [loading, setLoading]             = useState(true)
+  const [error, setError]                 = useState<string | null>(null)
+  const [groupPhotos, setGroupPhotos]     = useState<GroupPhoto[]>([])
+  const [clusters, setClusters]           = useState<FaceCluster[]>([])
+  const [named, setNamed]                 = useState(0)
+  const [expected, setExpected]           = useState<number | null>(null)
+  const [nameInputs, setNameInputs]       = useState<Record<number, string>>({})
+  const [saving, setSaving]               = useState<Set<number>>(new Set())
+  const [savedNames, setSavedNames]       = useState<Record<number, string>>({})
+  const [dismissed, setDismissed]         = useState<Set<number>>(new Set())
+  const [carouselIdx, setCarouselIdx]     = useState(0)
+  const [tripName, setTripName]           = useState('')
+  const [enrolledPersons, setEnrolledPersons] = useState<EnrolledPerson[]>([])
+  const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null)
+  const [deleting, setDeleting]           = useState<string | null>(null)
 
   useEffect(() => {
     if (!id) return
     async function load() {
       try {
-        const [photosData, clusterData] = await Promise.all([
+        const [trip, photosData, clusterData, personsData] = await Promise.all([
+          api.trips.get(id!),
           api.enrollment.groupPhotos(id!),
           api.enrollment.clusters(id!),
+          api.enrollment.persons(id!),
         ])
+        setTripName(trip.name)
         setGroupPhotos(photosData)
         setClusters(clusterData.clusters)
         setNamed(clusterData.named)
         setExpected(clusterData.expected)
+        setEnrolledPersons(personsData)
       } catch (e) {
         setError(e instanceof Error ? e.message : 'Failed to load enrollment data')
       } finally {
@@ -48,6 +58,8 @@ export function Enroll() {
       await api.enrollment.nameCluster(id, name, cluster.face_ids)
       setSavedNames(prev => ({ ...prev, [cluster.cluster_id]: name }))
       setNamed(prev => prev + 1)
+      const personsData = await api.enrollment.persons(id)
+      setEnrolledPersons(personsData)
     } catch (e) {
       alert(e instanceof Error ? e.message : 'Save failed')
     } finally {
@@ -65,186 +77,293 @@ export function Enroll() {
     }
   }
 
-  if (loading) return (
-    <div className="min-h-screen bg-zinc-950 flex items-center justify-center">
-      <Loader2 className="text-violet-400 animate-spin" size={28} />
-    </div>
-  )
+  async function deletePerson(personId: string) {
+    if (!id) return
+    setDeleting(personId)
+    try {
+      await api.enrollment.deletePerson(id, personId)
+      setEnrolledPersons(prev => prev.filter(p => p.person_id !== personId))
+      setNamed(prev => Math.max(0, prev - 1))
+      // Reload clusters — freed faces may now appear as pending clusters
+      const clusterData = await api.enrollment.clusters(id)
+      setClusters(clusterData.clusters)
+    } catch (e) {
+      alert(e instanceof Error ? e.message : 'Delete failed')
+    } finally {
+      setDeleting(null)
+      setConfirmDeleteId(null)
+    }
+  }
 
-  if (error) return (
-    <div className="min-h-screen bg-zinc-950 flex items-center justify-center">
-      <p className="text-red-400">{error}</p>
-    </div>
-  )
+  async function dismissAll(targets: FaceCluster[]) {
+    if (!id) return
+    for (const c of targets) {
+      if (!dismissed.has(c.cluster_id)) {
+        try {
+          await api.enrollment.dismissCluster(id, c.face_ids)
+          setDismissed(prev => new Set(prev).add(c.cluster_id))
+        } catch { /* continue */ }
+      }
+    }
+  }
 
-  const activeClusters = clusters.filter(
-    c => !(c.cluster_id in savedNames) && !dismissed.has(c.cluster_id)
-  )
-  const groupClusters = activeClusters.filter(c => !c.is_singleton)
+  if (loading) {
+    return (
+      <div style={{ minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', background: 'var(--bg)' }}>
+        <Loader2 className="animate-spin" size={24} style={{ color: 'var(--accent)' }} />
+      </div>
+    )
+  }
+
+  if (error) {
+    return (
+      <div style={{ minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', background: 'var(--bg)' }}>
+        <p style={{ color: 'var(--error)' }}>{error}</p>
+      </div>
+    )
+  }
+
+  const activeClusters    = clusters.filter(c => !(c.cluster_id in savedNames) && !dismissed.has(c.cluster_id))
+  const groupClusters     = activeClusters.filter(c => !c.is_singleton)
   const singletonClusters = activeClusters.filter(c => c.is_singleton)
-  const namedEntries = Object.entries(savedNames)
-  const coveragePct = expected ? Math.min(Math.round((named / expected) * 100), 100) : 0
+  const coveragePct       = expected ? Math.min(Math.round((named / expected) * 100), 100) : 0
+  const currentPhoto      = groupPhotos[carouselIdx]
+
+  const breadcrumbs = [
+    { label: tripName, href: `/trips/${id}` },
+    { label: 'Enroll' },
+  ]
 
   return (
-    <div className="min-h-screen bg-zinc-950 text-white">
-      <div className="max-w-4xl mx-auto px-6 py-10">
-
-        {/* Header */}
-        <div className="flex items-center justify-between mb-8">
-          <button
-            onClick={() => navigate(`/trips/${id}`)}
-            className="flex items-center gap-2 text-zinc-500 hover:text-zinc-300 text-sm transition-colors"
-          >
-            <ArrowLeft size={16} /> Back to trip
-          </button>
-          {named > 0 && (
+    <div style={{ minHeight: '100vh', display: 'flex', flexDirection: 'column', background: 'var(--bg)' }}>
+      <Topbar
+        breadcrumbs={breadcrumbs}
+        backHref={`/trips/${id}`}
+        actions={
+          named > 0 ? (
             <button
               onClick={() => navigate(`/trips/${id}`)}
-              className="flex items-center gap-2 px-4 py-2 bg-violet-600 hover:bg-violet-500 rounded-lg text-sm font-medium transition-colors"
+              style={{ background: '#22C55E', color: '#06140b', border: 'none', borderRadius: 7, padding: '9px 16px', fontSize: 13, fontWeight: 700, cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 6 }}
             >
-              <CheckCircle size={15} /> Done
+              Done ✓
             </button>
-          )}
-        </div>
+          ) : undefined
+        }
+      />
 
-        <h1 className="text-2xl font-bold mb-6">Enrollment</h1>
+      <div style={{ display: 'flex', flex: 1 }}>
 
-        {/* Coverage Bar */}
-        <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-4 mb-8">
-          <div className="flex justify-between text-sm mb-2">
-            <span className="text-zinc-400 flex items-center gap-1.5">
-              <Users size={14} /> People identified
-            </span>
-            <span className="text-white font-medium">
-              {named}{expected ? ` / ${expected}` : ''}
-            </span>
+        {/* ── Left: Group photo carousel ── */}
+        <div style={{ width: 300, flexShrink: 0, borderRight: '1px solid var(--border)', padding: 22, background: 'var(--bg)' }}>
+
+          <div style={{ fontSize: 12, fontWeight: 600, color: '#71717A', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 14 }}>
+            Group photos
           </div>
-          {expected && (
-            <div className="h-1.5 bg-zinc-800 rounded-full overflow-hidden">
-              <div
-                className="h-full bg-violet-500 rounded-full transition-all duration-500"
-                style={{ width: `${coveragePct}%` }}
-              />
+
+          {groupPhotos.length > 0 && currentPhoto ? (
+            <div style={{ background: 'var(--surface)', border: '1px solid var(--border)', borderRadius: 12, padding: 14 }}>
+              <div style={{ fontSize: 12, fontFamily: 'ui-monospace, monospace', color: '#71717A', marginBottom: 10, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                {currentPhoto.file_name} · {currentPhoto.face_count} faces
+              </div>
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 8 }}>
+                {currentPhoto.face_crops.slice(0, 6).map((crop, i) => (
+                  <img
+                    key={i}
+                    src={`data:image/jpeg;base64,${crop}`}
+                    style={{ width: '100%', aspectRatio: '1', objectFit: 'cover', borderRadius: 8 }}
+                    alt=""
+                  />
+                ))}
+              </div>
+            </div>
+          ) : (
+            <div style={{ background: 'var(--surface)', border: '1px solid var(--border)', borderRadius: 12, padding: 16, textAlign: 'center' }}>
+              <p style={{ fontSize: 12, color: 'var(--text-muted)' }}>No group photos found</p>
             </div>
           )}
-        </div>
 
-        {/* Group Photos */}
-        {groupPhotos.length > 0 && (
-          <div className="mb-8">
-            <h2 className="text-xs font-medium text-zinc-500 uppercase tracking-widest mb-3">
-              Group Photos
-            </h2>
-            <div className="flex gap-3 overflow-x-auto pb-2">
-              {groupPhotos.map(photo => (
-                <div
-                  key={photo.id}
-                  className="flex-shrink-0 bg-zinc-900 border border-zinc-800 rounded-xl p-3 w-56"
-                >
-                  <div className="flex gap-1 mb-2 flex-wrap">
-                    {photo.face_crops.map((crop, i) => (
-                      <img
-                        key={i}
-                        src={`data:image/jpeg;base64,${crop}`}
-                        className="w-8 h-8 rounded object-cover"
-                        alt=""
-                      />
-                    ))}
-                  </div>
-                  <p className="text-xs text-zinc-400 truncate">{photo.file_name}</p>
-                  <p className="text-xs text-zinc-600">{photo.face_count} faces</p>
+          {/* Carousel nav */}
+          {groupPhotos.length > 1 && (
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginTop: 14 }}>
+              <button
+                onClick={() => setCarouselIdx(i => Math.max(0, i - 1))}
+                disabled={carouselIdx === 0}
+                style={{ width: 32, height: 32, borderRadius: 8, background: 'var(--surface)', border: '1px solid var(--border)', color: '#a1a1aa', display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer', opacity: carouselIdx === 0 ? 0.3 : 1 }}
+              >
+                <ChevronLeft size={14} />
+              </button>
+              {groupPhotos.length <= 10 ? (
+                <div style={{ display: 'flex', gap: 6 }}>
+                  {groupPhotos.map((_, i) => (
+                    <button
+                      key={i}
+                      onClick={() => setCarouselIdx(i)}
+                      style={{ width: 7, height: 7, borderRadius: '50%', background: i === carouselIdx ? 'var(--accent)' : '#3f3f46', border: 'none', cursor: 'pointer', padding: 0 }}
+                    />
+                  ))}
                 </div>
-              ))}
+              ) : (
+                <span style={{ fontSize: 12, color: '#71717A', fontVariantNumeric: 'tabular-nums' }}>
+                  {carouselIdx + 1} / {groupPhotos.length}
+                </span>
+              )}
+              <button
+                onClick={() => setCarouselIdx(i => Math.min(groupPhotos.length - 1, i + 1))}
+                disabled={carouselIdx === groupPhotos.length - 1}
+                style={{ width: 32, height: 32, borderRadius: 8, background: 'var(--surface)', border: '1px solid var(--border)', color: '#a1a1aa', display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer', opacity: carouselIdx === groupPhotos.length - 1 ? 0.3 : 1 }}
+              >
+                <ChevronRight size={14} />
+              </button>
             </div>
-          </div>
-        )}
+          )}
 
-        {/* Group member clusters */}
-        {groupClusters.length > 0 && (
-          <div className="mb-8">
-            <h2 className="text-xs font-medium text-zinc-500 uppercase tracking-widest mb-3">
-              Group Members
-              <span className="text-zinc-700 font-normal ml-2 normal-case">
-                {groupClusters.length} clusters · ≥3 appearances each
-              </span>
-            </h2>
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-              {groupClusters.map(cluster => (
-                <ClusterCard
-                  key={cluster.cluster_id}
-                  cluster={cluster}
-                  value={nameInputs[cluster.cluster_id] || ''}
-                  onChange={val => setNameInputs(prev => ({ ...prev, [cluster.cluster_id]: val }))}
-                  onSave={() => saveName(cluster)}
-                  saving={saving.has(cluster.cluster_id)}
-                />
-              ))}
+          {/* Identified progress */}
+          {expected && (
+            <div style={{ marginTop: 22 }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 12, fontWeight: 600, color: '#a1a1aa', marginBottom: 8 }}>
+                <span>Identified</span>
+                <span style={{ color: 'var(--text-primary)' }}>{named} / {expected}</span>
+              </div>
+              <div style={{ height: 8, borderRadius: 6, background: 'var(--surface)', border: '1px solid var(--border)', overflow: 'hidden' }}>
+                <div style={{ height: '100%', width: `${coveragePct}%`, background: 'var(--accent)', borderRadius: 6, transition: 'width 0.5s' }} />
+              </div>
             </div>
-          </div>
-        )}
+          )}
+        </div>
 
-        {/* Singleton / rare clusters */}
-        {singletonClusters.length > 0 && (
-          <div className="mb-8">
-            <h2 className="text-xs font-medium text-zinc-500 uppercase tracking-widest mb-3">
-              Unknown Faces
-              <span className="text-zinc-700 font-normal ml-2 normal-case">
-                appeared once or twice — likely strangers
-              </span>
-            </h2>
-            <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-3">
-              {singletonClusters.map(cluster => (
-                <SingletonCard
-                  key={cluster.cluster_id}
-                  cluster={cluster}
-                  onDismiss={() => dismissCluster(cluster)}
-                  onName={val => saveName(cluster, val)}
-                />
-              ))}
+        {/* ── Right: Roster ── */}
+        <div style={{ flex: 1, minWidth: 0, padding: '24px 26px', overflowY: 'auto' }}>
+
+          {/* Group members */}
+          {groupClusters.length > 0 && (
+            <div style={{ marginBottom: 24 }}>
+              <div style={{ display: 'flex', alignItems: 'baseline', gap: 10, marginBottom: 14 }}>
+                <span style={{ fontSize: 15, fontWeight: 700, color: 'var(--text-primary)' }}>Group members</span>
+                <span style={{ fontSize: 12, color: '#71717A' }}>clusters with ≥3 appearances</span>
+              </div>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+                {groupClusters.map(cluster => (
+                  <ClusterRow
+                    key={cluster.cluster_id}
+                    cluster={cluster}
+                    value={nameInputs[cluster.cluster_id] || ''}
+                    onChange={val => setNameInputs(prev => ({ ...prev, [cluster.cluster_id]: val }))}
+                    onSave={() => saveName(cluster)}
+                    saving={saving.has(cluster.cluster_id)}
+                  />
+                ))}
+              </div>
             </div>
-          </div>
-        )}
+          )}
 
-        {/* Named summary */}
-        {namedEntries.length > 0 && (
-          <div className="mb-8">
-            <h2 className="text-xs font-medium text-zinc-500 uppercase tracking-widest mb-3">Named</h2>
-            <div className="flex flex-wrap gap-2">
-              {namedEntries.map(([clusterId, name]) => {
-                const cluster = clusters.find(c => c.cluster_id === Number(clusterId))
-                return (
+          {/* Enrolled roster — loaded from DB, persistent across sessions */}
+          {enrolledPersons.length > 0 && (
+            <div style={{ marginBottom: 24 }}>
+              <div style={{ fontSize: 15, fontWeight: 700, color: 'var(--text-primary)', marginBottom: 14 }}>
+                Enrolled roster
+              </div>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                {enrolledPersons.map(person => (
                   <div
-                    key={clusterId}
-                    className="flex items-center gap-2 bg-zinc-900 border border-emerald-900 rounded-lg px-3 py-2"
+                    key={person.person_id}
+                    style={{
+                      display: 'flex', alignItems: 'center', gap: 12,
+                      background: 'var(--surface)', border: '1px solid var(--border)',
+                      borderRadius: 10, padding: '10px 12px',
+                    }}
                   >
-                    {cluster?.representative_crops[0] && (
+                    {person.thumbnail ? (
                       <img
-                        src={`data:image/jpeg;base64,${cluster.representative_crops[0]}`}
-                        className="w-7 h-7 rounded-full object-cover"
+                        src={`data:image/jpeg;base64,${person.thumbnail}`}
+                        style={{ width: 36, height: 36, borderRadius: '50%', objectFit: 'cover', flexShrink: 0 }}
                         alt=""
                       />
+                    ) : (
+                      <div style={{ width: 36, height: 36, borderRadius: '50%', background: 'var(--surface-2)', flexShrink: 0 }} />
                     )}
-                    <span className="text-sm text-emerald-400">{name}</span>
-                    <CheckCircle size={13} className="text-emerald-600" />
-                  </div>
-                )
-              })}
-            </div>
-          </div>
-        )}
+                    <span style={{ flex: 1, fontSize: 14, fontWeight: 600, color: 'var(--text-primary)' }}>
+                      {person.name}
+                    </span>
+                    <span style={{ fontSize: 12, color: 'var(--text-muted)', marginRight: 8 }}>
+                      {person.face_count} photo{person.face_count !== 1 ? 's' : ''}
+                    </span>
 
-        {clusters.length === 0 && (
-          <div className="text-center py-16 text-zinc-600">
-            No unenrolled faces — all faces have been named or dismissed.
-          </div>
-        )}
+                    {confirmDeleteId === person.person_id ? (
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                        <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>Remove?</span>
+                        <button
+                          onClick={() => deletePerson(person.person_id)}
+                          disabled={deleting === person.person_id}
+                          style={{ fontSize: 12, fontWeight: 600, color: '#fca5a5', background: 'rgba(239,68,68,.12)', border: '1px solid rgba(239,68,68,.3)', borderRadius: 6, padding: '4px 10px', cursor: 'pointer' }}
+                        >
+                          {deleting === person.person_id ? <Loader2 size={12} className="animate-spin" /> : 'Yes'}
+                        </button>
+                        <button
+                          onClick={() => setConfirmDeleteId(null)}
+                          style={{ fontSize: 12, color: 'var(--text-muted)', background: 'transparent', border: '1px solid var(--border)', borderRadius: 6, padding: '4px 10px', cursor: 'pointer' }}
+                        >
+                          No
+                        </button>
+                      </div>
+                    ) : (
+                      <button
+                        onClick={() => setConfirmDeleteId(person.person_id)}
+                        style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 12, color: 'var(--text-muted)', background: 'transparent', border: '1px solid var(--border)', borderRadius: 6, padding: '5px 9px', cursor: 'pointer' }}
+                        onMouseEnter={e => { e.currentTarget.style.color = 'var(--error)'; e.currentTarget.style.borderColor = 'rgba(239,68,68,.4)' }}
+                        onMouseLeave={e => { e.currentTarget.style.color = 'var(--text-muted)'; e.currentTarget.style.borderColor = 'var(--border)' }}
+                      >
+                        <Trash2 size={12} /> Remove
+                      </button>
+                    )}
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* Likely strangers */}
+          {singletonClusters.length > 0 && (
+            <div>
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 14 }}>
+                <div style={{ display: 'flex', alignItems: 'baseline', gap: 10 }}>
+                  <span style={{ fontSize: 15, fontWeight: 700, color: 'var(--text-primary)' }}>Likely strangers</span>
+                  <span style={{ fontSize: 12, color: '#71717A' }}>singletons</span>
+                </div>
+                <button
+                  onClick={() => dismissAll(singletonClusters)}
+                  style={{ background: 'transparent', color: '#a1a1aa', border: '1px solid var(--border)', borderRadius: 8, padding: '7px 12px', fontSize: 12, fontWeight: 600, cursor: 'pointer' }}
+                >
+                  Dismiss all ({singletonClusters.length})
+                </button>
+              </div>
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 10 }}>
+                {singletonClusters.map(cluster => (
+                  <SingletonCard
+                    key={cluster.cluster_id}
+                    cluster={cluster}
+                    onDismiss={() => dismissCluster(cluster)}
+                    onName={val => saveName(cluster, val)}
+                  />
+                ))}
+              </div>
+            </div>
+          )}
+
+          {clusters.length === 0 && (
+            <div style={{ paddingTop: 64, textAlign: 'center' }}>
+              <p style={{ fontSize: 14, color: 'var(--text-muted)' }}>All faces have been named or dismissed.</p>
+            </div>
+          )}
+        </div>
 
       </div>
     </div>
   )
 }
 
-function ClusterCard({ cluster, value, onChange, onSave, saving }: {
+// ── Cluster row ────────────────────────────────────────────────────────────────
+
+function ClusterRow({ cluster, value, onChange, onSave, saving }: {
   cluster: FaceCluster
   value: string
   onChange: (v: string) => void
@@ -252,38 +371,66 @@ function ClusterCard({ cluster, value, onChange, onSave, saving }: {
   saving: boolean
 }) {
   return (
-    <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-4">
-      <div className="flex gap-2 mb-3">
-        {cluster.representative_crops.slice(0, 4).map((crop, i) => (
+    <div
+      style={{
+        display: 'flex', alignItems: 'center', gap: 14,
+        background: 'var(--surface)', border: '1px solid var(--border)',
+        borderRadius: 12, padding: '12px 14px',
+      }}
+    >
+      {/* Overlapping face crops */}
+      <div style={{ display: 'flex', flexShrink: 0 }}>
+        {cluster.representative_crops.slice(0, 3).map((crop, i) => (
           <img
             key={i}
             src={`data:image/jpeg;base64,${crop}`}
-            className="w-14 h-14 rounded-lg object-cover"
+            style={{
+              width: 44, height: 44, borderRadius: 10, objectFit: 'cover',
+              border: '2px solid var(--surface)',
+              marginLeft: i > 0 ? -12 : 0,
+            }}
             alt=""
           />
         ))}
       </div>
-      <p className="text-xs text-zinc-600 mb-3">{cluster.size} appearances</p>
-      <div className="flex gap-2">
-        <input
-          type="text"
-          value={value}
-          onChange={e => onChange(e.target.value)}
-          onKeyDown={e => { if (e.key === 'Enter') onSave() }}
-          placeholder="Enter name…"
-          className="flex-1 bg-zinc-800 border border-zinc-700 rounded-lg px-3 py-2 text-sm text-white placeholder-zinc-600 focus:outline-none focus:border-violet-500"
-        />
-        <button
-          onClick={onSave}
-          disabled={!value.trim() || saving}
-          className="px-3 py-2 bg-violet-600 hover:bg-violet-500 disabled:bg-zinc-800 disabled:text-zinc-600 rounded-lg text-sm font-medium transition-colors"
-        >
-          {saving ? <Loader2 size={14} className="animate-spin" /> : 'Save'}
-        </button>
-      </div>
+
+      <span style={{ fontSize: 12, fontWeight: 500, color: '#71717A', width: 90, flexShrink: 0 }}>
+        {cluster.size} appearances
+      </span>
+
+      {/* Name input */}
+      <input
+        type="text"
+        value={value}
+        onChange={e => onChange(e.target.value)}
+        onKeyDown={e => { if (e.key === 'Enter') onSave() }}
+        placeholder="Name this person…"
+        style={{
+          flex: 1, height: 38, border: '1px solid var(--border)', borderRadius: 8,
+          background: 'var(--bg)', color: '#52525b', padding: '0 12px', fontSize: 13, outline: 'none',
+        }}
+        onFocus={e => { e.currentTarget.style.borderColor = 'var(--accent)'; e.currentTarget.style.color = 'var(--text-primary)' }}
+        onBlur={e => { e.currentTarget.style.borderColor = 'var(--border)'; e.currentTarget.style.color = '#52525b' }}
+      />
+
+      <button
+        onClick={onSave}
+        disabled={!value.trim() || saving}
+        style={{
+          background: 'var(--accent)', color: '#fff', border: 'none',
+          borderRadius: 8, padding: '9px 16px', fontSize: 13, fontWeight: 600,
+          cursor: !value.trim() || saving ? 'not-allowed' : 'pointer',
+          opacity: !value.trim() || saving ? 0.4 : 1,
+          flexShrink: 0,
+        }}
+      >
+        {saving ? <Loader2 size={14} className="animate-spin" /> : 'Save'}
+      </button>
     </div>
   )
 }
+
+// ── Singleton card ─────────────────────────────────────────────────────────────
 
 function SingletonCard({ cluster, onDismiss, onName }: {
   cluster: FaceCluster
@@ -294,20 +441,23 @@ function SingletonCard({ cluster, onDismiss, onName }: {
   const [val, setVal] = useState('')
 
   return (
-    <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-3">
-      <div className="flex gap-1 mb-2">
-        {cluster.representative_crops.slice(0, 2).map((crop, i) => (
-          <img
-            key={i}
-            src={`data:image/jpeg;base64,${crop}`}
-            className="w-12 h-12 rounded-lg object-cover"
-            alt=""
-          />
-        ))}
+    <div
+      style={{
+        background: 'var(--surface)', border: '1px solid var(--border)',
+        borderRadius: 12, padding: 12, textAlign: 'center',
+      }}
+    >
+      {cluster.representative_crops[0] && (
+        <img
+          src={`data:image/jpeg;base64,${cluster.representative_crops[0]}`}
+          style={{ width: '100%', aspectRatio: '1', objectFit: 'cover', borderRadius: 10, marginBottom: 8, display: 'block' }}
+          alt=""
+        />
+      )}
+      <div style={{ fontSize: 11, fontWeight: 500, color: '#71717A', marginBottom: 8 }}>
+        {cluster.size}×
       </div>
-      <p className="text-xs text-zinc-700 mb-2">
-        {cluster.size} appearance{cluster.size !== 1 ? 's' : ''}
-      </p>
+
       {showInput ? (
         <input
           type="text"
@@ -317,22 +467,24 @@ function SingletonCard({ cluster, onDismiss, onName }: {
           onBlur={() => { if (!val.trim()) setShowInput(false) }}
           autoFocus
           placeholder="Name…"
-          className="w-full bg-zinc-800 border border-zinc-700 rounded px-2 py-1 text-xs text-white focus:outline-none focus:border-violet-500"
+          style={{
+            width: '100%', boxSizing: 'border-box', borderRadius: 6, padding: '4px 8px', fontSize: 11, outline: 'none',
+            background: 'var(--bg)', border: '1px solid var(--border)', color: 'var(--text-primary)',
+          }}
         />
       ) : (
-        <div className="flex gap-1">
+        <div style={{ display: 'flex', gap: 6 }}>
           <button
             onClick={() => setShowInput(true)}
-            className="flex-1 text-xs text-zinc-500 hover:text-white border border-zinc-800 hover:border-zinc-600 rounded px-2 py-1 transition-colors"
+            style={{ flex: 1, background: 'var(--accent)', color: '#fff', border: 'none', borderRadius: 6, padding: '6px 0', fontSize: 11, fontWeight: 600, cursor: 'pointer' }}
           >
             Name
           </button>
           <button
             onClick={onDismiss}
-            className="text-xs text-zinc-600 hover:text-red-400 border border-zinc-800 hover:border-red-900 rounded px-2 py-1 transition-colors"
-            title="Dismiss as stranger"
+            style={{ width: 30, background: 'var(--bg)', color: '#71717A', border: '1px solid var(--border)', borderRadius: 6, fontSize: 12, cursor: 'pointer' }}
           >
-            <X size={12} />
+            ✕
           </button>
         </div>
       )}

@@ -1,9 +1,21 @@
 @import "tailwindcss";
 
 :root {
-  font-family: system-ui, -apple-system, sans-serif;
+  font-family: 'Inter', system-ui, -apple-system, sans-serif;
   -webkit-font-smoothing: antialiased;
   color-scheme: dark;
+
+  --bg: #0D0D12;
+  --surface: #16161F;
+  --surface-2: #1E1E2A;
+  --border: #27272A;
+  --accent: #7C6EF8;
+  --accent-hover: #6457E8;
+  --success: #22C55E;
+  --warning: #F59E0B;
+  --error: #EF4444;
+  --text-primary: #F4F4F5;
+  --text-muted: #71717A;
 }
 
 * {
@@ -13,7 +25,50 @@
 }
 
 body {
-  background: #0f0f12;
-  color: #e4e4e7;
+  background: var(--bg);
+  color: var(--text-primary);
   min-height: 100vh;
+}
+
+.btn-primary {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 16px;
+  background: var(--accent);
+  color: #fff;
+  border-radius: 8px;
+  font-size: 14px;
+  font-weight: 500;
+  cursor: pointer;
+  border: none;
+  transition: background 0.15s;
+}
+
+.btn-primary:hover:not(:disabled) {
+  background: var(--accent-hover);
+}
+
+.btn-primary:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+@keyframes indeterminate-slide {
+  0%   { transform: translateX(-100%); }
+  100% { transform: translateX(400%); }
+}
+
+.progress-indeterminate {
+  animation: indeterminate-slide 1.4s ease-in-out infinite;
+}
+
+@keyframes wring {
+  0%   { transform: scale(0.8); opacity: 0.55; }
+  100% { transform: scale(1.7); opacity: 0; }
+}
+
+@keyframes wpulse {
+  0%, 100% { opacity: 1; }
+  50%       { opacity: 0.3; }
 }
