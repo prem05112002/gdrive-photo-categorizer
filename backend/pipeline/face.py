@@ -1,18 +1,35 @@
 import io
+import itertools
 import threading
 import uuid
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Optional
 
+import cv2
 import numpy as np
 from PIL import Image
+import pillow_heif
 
 from database.models import SessionLocal, Photo, FaceObservation
 from database import crud  # noqa: F401 — used in error handler
 
+pillow_heif.register_heif_opener()  # HEIC support — must happen before any Image.open
+
 GROUP_PHOTO_MIN_FACES = 5   # photos with ≥ this many faces are group photo candidates
 MAX_LONG_SIDE = 1920        # resize before detection to bound memory usage
 FACE_PAD = 0.25             # fractional padding around each face crop
+
+DECODE_WORKERS = 4          # decode/resize images ahead of the detector
+COMMIT_BATCH = 25           # photos per DB commit
+
+# Quality gate — faces failing any of these produce unreliable embeddings and
+# would only pollute clustering. They are stored (for gallery display) but
+# flagged is_low_quality and excluded from enrollment clustering.
+MIN_DET_SCORE = 0.65
+MIN_FACE_SIZE = 40          # px, in detection space (MAX_LONG_SIDE-resized image)
+MIN_BLUR_VAR = 45.0         # Laplacian variance on the gray face crop
 
 # ── Progress (mirrors ingest.py pattern) ──────────────────────────────────────
 
@@ -98,13 +115,52 @@ def _face_crop_bytes(img: np.ndarray, x1: int, y1: int, x2: int, y2: int) -> byt
     return buf.getvalue()
 
 
+def _face_quality(img: np.ndarray, x1: int, y1: int, x2: int, y2: int,
+                  det_score: float) -> tuple[float, bool]:
+    """Return (blur_score, is_low_quality) for a detected face."""
+    h, w = img.shape[:2]
+    crop = img[max(0, y1):min(h, y2), max(0, x1):min(w, x2)]
+    if crop.size == 0:
+        return 0.0, True
+    gray = cv2.cvtColor(crop, cv2.COLOR_RGB2GRAY)
+    blur = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+    low = (
+        det_score < MIN_DET_SCORE
+        or min(x2 - x1, y2 - y1) < MIN_FACE_SIZE
+        or blur < MIN_BLUR_VAR
+    )
+    return blur, low
+
+
+def _decoded_stream(photos: list):
+    """
+    Yield (photo, img_or_None) with decode/resize running DECODE_WORKERS ahead
+    on background threads, so the detector never waits on image I/O.
+    """
+    def load(photo):
+        path = Path(photo.local_path)
+        return _load_image(path) if path.exists() else None
+
+    with ThreadPoolExecutor(max_workers=DECODE_WORKERS) as pool:
+        it = iter(photos)
+        queue = deque(
+            (p, pool.submit(load, p)) for p in itertools.islice(it, DECODE_WORKERS * 2)
+        )
+        while queue:
+            photo, fut = queue.popleft()
+            for nxt in itertools.islice(it, 1):
+                queue.append((nxt, pool.submit(load, nxt)))
+            yield photo, fut.result()
+
+
 # ── Main pipeline ─────────────────────────────────────────────────────────────
 
 def run_face_pipeline(trip_id: str) -> None:
     """
     Detect faces in every processable photo for a trip.
-    For each face: stores a FaceObservation with raw 512-dim embedding + face crop.
-    Updates Photo.face_count and Photo.is_group_photo.
+    For each face: stores a FaceObservation with raw 512-dim embedding + face crop
+    + quality flags. Updates Photo.face_count and Photo.is_group_photo.
+    Re-running is idempotent: prior unassigned observations are cleared first.
     Runs synchronously — call via start_face_pipeline_thread() for background use.
     """
     session = SessionLocal()
@@ -122,22 +178,28 @@ def run_face_pipeline(trip_id: str) -> None:
                 total=total,
                 processed=0,
                 faces_found=0,
-                group_photos=0)
+                group_photos=0,
+                low_quality=0)
 
         model = get_model()  # downloads buffalo_l on first run (~235 MB)
+
+        # Idempotent re-run: drop unassigned observations from any earlier run
+        photo_ids = [p.id for p in photos]
+        if photo_ids:
+            session.query(FaceObservation).filter(
+                FaceObservation.photo_id.in_(photo_ids),
+                FaceObservation.person_id.is_(None),
+            ).delete(synchronize_session=False)
+            session.commit()
 
         _update(trip_id, status="processing")
 
         faces_found = 0
         group_photo_count = 0
+        low_quality_count = 0
+        since_commit = 0
 
-        for idx, photo in enumerate(photos):
-            path = Path(photo.local_path)
-            if not path.exists():
-                _update(trip_id, processed=idx + 1)
-                continue
-
-            img = _load_image(path)
+        for idx, (photo, img) in enumerate(_decoded_stream(photos)):
             if img is None:
                 _update(trip_id, processed=idx + 1)
                 continue
@@ -154,6 +216,10 @@ def run_face_pipeline(trip_id: str) -> None:
 
             for face in faces:
                 x1, y1, x2, y2 = face.bbox.astype(int)
+                det_score = float(face.det_score)
+                blur, low_q = _face_quality(img, x1, y1, x2, y2, det_score)
+                if low_q:
+                    low_quality_count += 1
 
                 obs = FaceObservation(
                     id=str(uuid.uuid4()),
@@ -163,12 +229,17 @@ def run_face_pipeline(trip_id: str) -> None:
                     bbox_y=int(y1),
                     bbox_w=int(x2 - x1),
                     bbox_h=int(y2 - y1),
-                    confidence=float(face.det_score),
+                    confidence=det_score,
+                    blur_score=blur,
+                    is_low_quality=low_q,
                     face_crop=_face_crop_bytes(img, x1, y1, x2, y2),
                 )
                 session.add(obs)
 
-            session.commit()
+            since_commit += 1
+            if since_commit >= COMMIT_BATCH:
+                session.commit()
+                since_commit = 0
 
             faces_found += face_count
             if is_group:
@@ -177,7 +248,10 @@ def run_face_pipeline(trip_id: str) -> None:
             _update(trip_id,
                     processed=idx + 1,
                     faces_found=faces_found,
-                    group_photos=group_photo_count)
+                    group_photos=group_photo_count,
+                    low_quality=low_quality_count)
+
+        session.commit()
 
         crud.update_trip_status(session, trip_id, "faces_extracted")
         _update(trip_id,
@@ -185,7 +259,8 @@ def run_face_pipeline(trip_id: str) -> None:
                 total=total,
                 processed=total,
                 faces_found=faces_found,
-                group_photos=group_photo_count)
+                group_photos=group_photo_count,
+                low_quality=low_quality_count)
 
     except Exception as e:
         crud.fail_trip(session, trip_id, str(e))

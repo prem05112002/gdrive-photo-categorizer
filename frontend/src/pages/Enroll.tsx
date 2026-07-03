@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
-import { Loader2, ChevronLeft, ChevronRight, Trash2 } from 'lucide-react'
+import { Loader2, ChevronLeft, ChevronRight, ChevronDown, Trash2 } from 'lucide-react'
 import { api, type GroupPhoto, type FaceCluster, type EnrolledPerson } from '../api/client'
 import { Topbar } from '../components/Topbar'
 
@@ -16,8 +16,10 @@ export function Enroll() {
   const [expected, setExpected]           = useState<number | null>(null)
   const [nameInputs, setNameInputs]       = useState<Record<number, string>>({})
   const [saving, setSaving]               = useState<Set<number>>(new Set())
-  const [savedNames, setSavedNames]       = useState<Record<number, string>>({})
+  const [savedNames, setSavedNames]       = useState<Record<number, { name: string; personId: string }>>({})
   const [dismissed, setDismissed]         = useState<Set<number>>(new Set())
+  const [lowQuality, setLowQuality]       = useState(0)
+  const [showStrangers, setShowStrangers] = useState(false)
   const [carouselIdx, setCarouselIdx]     = useState(0)
   const [tripName, setTripName]           = useState('')
   const [enrolledPersons, setEnrolledPersons] = useState<EnrolledPerson[]>([])
@@ -39,6 +41,7 @@ export function Enroll() {
         setClusters(clusterData.clusters)
         setNamed(clusterData.named)
         setExpected(clusterData.expected)
+        setLowQuality(clusterData.low_quality_count ?? 0)
         setEnrolledPersons(personsData)
       } catch (e) {
         setError(e instanceof Error ? e.message : 'Failed to load enrollment data')
@@ -55,8 +58,8 @@ export function Enroll() {
     if (!name) return
     setSaving(prev => new Set(prev).add(cluster.cluster_id))
     try {
-      await api.enrollment.nameCluster(id, name, cluster.face_ids)
-      setSavedNames(prev => ({ ...prev, [cluster.cluster_id]: name }))
+      const res = await api.enrollment.nameCluster(id, name, cluster.face_ids)
+      setSavedNames(prev => ({ ...prev, [cluster.cluster_id]: { name, personId: res.person_id } }))
       setNamed(prev => prev + 1)
       const personsData = await api.enrollment.persons(id)
       setEnrolledPersons(personsData)
@@ -92,6 +95,20 @@ export function Enroll() {
     } finally {
       setDeleting(null)
       setConfirmDeleteId(null)
+    }
+  }
+
+  async function confirmSuggestion(cluster: FaceCluster) {
+    if (!id || cluster.suggested_cluster_id == null) return
+    const target = savedNames[cluster.suggested_cluster_id]
+    if (!target) return
+    try {
+      await api.enrollment.assignFaces(id, target.personId, cluster.face_ids)
+      setSavedNames(prev => ({ ...prev, [cluster.cluster_id]: target }))
+      const personsData = await api.enrollment.persons(id)
+      setEnrolledPersons(personsData)
+    } catch (e) {
+      alert(e instanceof Error ? e.message : 'Assign failed')
     }
   }
 
@@ -321,14 +338,24 @@ export function Enroll() {
             </div>
           )}
 
-          {/* Likely strangers */}
+          {/* Likely strangers — collapsed by default; suggested faces float to the top */}
           {singletonClusters.length > 0 && (
             <div>
               <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 14 }}>
-                <div style={{ display: 'flex', alignItems: 'baseline', gap: 10 }}>
-                  <span style={{ fontSize: 15, fontWeight: 700, color: 'var(--text-primary)' }}>Likely strangers</span>
-                  <span style={{ fontSize: 12, color: '#71717A' }}>singletons</span>
-                </div>
+                <button
+                  onClick={() => setShowStrangers(s => !s)}
+                  style={{ display: 'flex', alignItems: 'center', gap: 8, background: 'transparent', border: 'none', padding: 0, cursor: 'pointer' }}
+                >
+                  <ChevronDown
+                    size={16}
+                    style={{ color: '#71717A', transform: showStrangers ? 'none' : 'rotate(-90deg)', transition: 'transform 0.15s' }}
+                  />
+                  <span style={{ fontSize: 15, fontWeight: 700, color: 'var(--text-primary)' }}>Needs review</span>
+                  <span style={{ fontSize: 12, fontWeight: 600, color: '#a1a1aa', background: 'var(--surface)', border: '1px solid var(--border)', borderRadius: 20, padding: '2px 9px' }}>
+                    {singletonClusters.length}
+                  </span>
+                  <span style={{ fontSize: 12, color: '#71717A' }}>one-off faces — likely strangers</span>
+                </button>
                 <button
                   onClick={() => dismissAll(singletonClusters)}
                   style={{ background: 'transparent', color: '#a1a1aa', border: '1px solid var(--border)', borderRadius: 8, padding: '7px 12px', fontSize: 12, fontWeight: 600, cursor: 'pointer' }}
@@ -336,17 +363,35 @@ export function Enroll() {
                   Dismiss all ({singletonClusters.length})
                 </button>
               </div>
-              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 10 }}>
-                {singletonClusters.map(cluster => (
-                  <SingletonCard
-                    key={cluster.cluster_id}
-                    cluster={cluster}
-                    onDismiss={() => dismissCluster(cluster)}
-                    onName={val => saveName(cluster, val)}
-                  />
-                ))}
-              </div>
+              {showStrangers && (
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 10 }}>
+                  {[...singletonClusters]
+                    .sort((a, b) => Number(b.suggested_cluster_id != null) - Number(a.suggested_cluster_id != null))
+                    .map(cluster => (
+                      <SingletonCard
+                        key={cluster.cluster_id}
+                        cluster={cluster}
+                        suggestionName={
+                          cluster.suggested_cluster_id != null
+                            ? savedNames[cluster.suggested_cluster_id]?.name ?? null
+                            : null
+                        }
+                        hasSuggestion={cluster.suggested_cluster_id != null}
+                        onConfirmSuggestion={() => confirmSuggestion(cluster)}
+                        onDismiss={() => dismissCluster(cluster)}
+                        onName={val => saveName(cluster, val)}
+                      />
+                    ))}
+                </div>
+              )}
             </div>
+          )}
+
+          {lowQuality > 0 && (
+            <p style={{ marginTop: 18, fontSize: 12, color: '#71717A' }}>
+              {lowQuality} low-quality face{lowQuality !== 1 ? 's' : ''} hidden (blurry, tiny, or uncertain) —
+              they'll be matched automatically during classification.
+            </p>
           )}
 
           {clusters.length === 0 && (
@@ -432,8 +477,11 @@ function ClusterRow({ cluster, value, onChange, onSave, saving }: {
 
 // ── Singleton card ─────────────────────────────────────────────────────────────
 
-function SingletonCard({ cluster, onDismiss, onName }: {
+function SingletonCard({ cluster, suggestionName, hasSuggestion, onConfirmSuggestion, onDismiss, onName }: {
   cluster: FaceCluster
+  suggestionName: string | null
+  hasSuggestion: boolean
+  onConfirmSuggestion: () => void
   onDismiss: () => void
   onName: (val: string) => void
 }) {
@@ -443,7 +491,8 @@ function SingletonCard({ cluster, onDismiss, onName }: {
   return (
     <div
       style={{
-        background: 'var(--surface)', border: '1px solid var(--border)',
+        background: 'var(--surface)',
+        border: hasSuggestion ? '1px solid rgba(124,110,248,.45)' : '1px solid var(--border)',
         borderRadius: 12, padding: 12, textAlign: 'center',
       }}
     >
@@ -457,6 +506,26 @@ function SingletonCard({ cluster, onDismiss, onName }: {
       <div style={{ fontSize: 11, fontWeight: 500, color: '#71717A', marginBottom: 8 }}>
         {cluster.size}×
       </div>
+
+      {suggestionName ? (
+        <button
+          onClick={onConfirmSuggestion}
+          title={`Assign this face to ${suggestionName}`}
+          style={{
+            display: 'block', width: '100%', marginBottom: 6,
+            background: 'rgba(124,110,248,.16)', color: '#c4b5fd',
+            border: '1px solid #7C6EF8', borderRadius: 20, padding: '4px 8px',
+            fontSize: 11, fontWeight: 600, cursor: 'pointer',
+            overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+          }}
+        >
+          {suggestionName}? ✓
+        </button>
+      ) : hasSuggestion ? (
+        <div style={{ marginBottom: 6, fontSize: 10, fontWeight: 600, color: '#c4b5fd' }}>
+          similar to a group member
+        </div>
+      ) : null}
 
       {showInput ? (
         <input

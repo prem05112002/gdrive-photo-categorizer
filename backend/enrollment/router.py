@@ -6,7 +6,7 @@ from sqlalchemy.orm import Session
 
 from database.models import get_session, FaceObservation, Photo, Person, PersonEmbedding, TripPerson
 from database import crud
-from enrollment.cluster import cluster_faces
+from enrollment.cluster import cluster_faces, count_low_quality
 
 from database.models import PersonOutfit, UnmatchedPerson
 
@@ -71,10 +71,12 @@ def get_clusters(trip_id: str, session: Session = Depends(get_session)):
                 "representative_crops": [
                     base64.b64encode(crop).decode() for crop in c["representative_crops"]
                 ],
+                "suggested_cluster_id": c["suggested_cluster_id"],
             }
             for c in clusters
         ],
         "total_faces_pending": sum(c["size"] for c in clusters),
+        "low_quality_count": count_low_quality(session, trip_id),
         "named": named,
         "expected": trip.expected_member_count,
     }
@@ -117,6 +119,45 @@ def name_cluster(trip_id: str, payload: NameClusterPayload, session: Session = D
 
     session.commit()
     return {"person_id": person.id, "name": person.name}
+
+
+class AssignFacesPayload(BaseModel):
+    person_id: str
+    face_ids: list[str]
+
+
+@router.post("/{trip_id}/assign-faces")
+def assign_faces(trip_id: str, payload: AssignFacesPayload, session: Session = Depends(get_session)):
+    """Assign faces to an already-enrolled person (e.g. confirming a singleton suggestion)."""
+    trip = crud.get_trip(session, trip_id)
+    if not trip:
+        raise HTTPException(404, "Trip not found")
+    person = session.query(Person).filter(Person.id == payload.person_id).first()
+    if not person:
+        raise HTTPException(404, "Person not found")
+
+    faces = session.query(FaceObservation).filter(FaceObservation.id.in_(payload.face_ids)).all()
+    if not faces:
+        raise HTTPException(404, "No faces found for given IDs")
+
+    for face in faces:
+        if face.raw_embedding:
+            session.add(PersonEmbedding(
+                person_id=person.id,
+                embedding=face.raw_embedding,
+                source_photo_id=face.photo_id,
+                quality_score=face.confidence,
+            ))
+        face.person_id = person.id
+
+    link = session.query(TripPerson).filter(
+        TripPerson.trip_id == trip_id, TripPerson.person_id == person.id,
+    ).first()
+    if not link:
+        session.add(TripPerson(trip_id=trip_id, person_id=person.id))
+
+    session.commit()
+    return {"assigned": len(faces), "person_id": person.id}
 
 
 class DismissPayload(BaseModel):

@@ -67,11 +67,13 @@ export interface FaceCluster {
   is_singleton: boolean
   face_ids: string[]
   representative_crops: string[]  // base64 JPEG
+  suggested_cluster_id: number | null
 }
 
 export interface ClusterResult {
   clusters: FaceCluster[]
   total_faces_pending: number
+  low_quality_count: number
   named: number
   expected: number | null
 }
@@ -410,6 +412,11 @@ export const api = {
       request<{ dismissed: number }>(`/enrollment/${tripId}/dismiss-cluster`, {
         method: 'POST',
         body: JSON.stringify({ face_ids: faceIds }),
+      }),
+    assignFaces: (tripId: string, personId: string, faceIds: string[]) =>
+      request<{ assigned: number; person_id: string }>(`/enrollment/${tripId}/assign-faces`, {
+        method: 'POST',
+        body: JSON.stringify({ person_id: personId, face_ids: faceIds }),
       }),
     coverage: (tripId: string) =>
       request<Coverage>(`/enrollment/${tripId}/coverage`),

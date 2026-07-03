@@ -111,6 +111,8 @@ class FaceObservation(Base):
     bbox_w = Column(Integer)
     bbox_h = Column(Integer)
     confidence = Column(Float)   # InsightFace det_score (0–1)
+    blur_score = Column(Float)          # Laplacian variance of the face crop
+    is_low_quality = Column(Boolean, default=False)  # fails quality gate — excluded from clustering
     is_stranger = Column(Boolean, default=False)
     face_crop = Column(LargeBinary)  # JPEG bytes of cropped face (256×256)
     drive_shortcut_id = Column(String)  # Drive shortcut file ID in person's folder (set during upload)
