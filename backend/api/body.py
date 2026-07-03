@@ -5,7 +5,6 @@ import json
 import uuid
 from pathlib import Path
 
-import cv2
 import numpy as np
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import Response
@@ -32,19 +31,30 @@ router = APIRouter()
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
-def _hist_cosine(h1_bytes: bytes, h2_bytes: bytes) -> float:
-    h1 = np.frombuffer(h1_bytes, dtype=np.float32)
-    h2 = np.frombuffer(h2_bytes, dtype=np.float32)
-    denom = float(np.linalg.norm(h1) * np.linalg.norm(h2))
-    return float(np.dot(h1, h2)) / denom if denom > 0 else 0.0
+# Face/body bboxes are stored in detection space (1920 long side — see
+# pipeline/face.py MAX_LONG_SIDE). Anything touching the original image
+# must convert with this scale factor.
+_DET_LONG_SIDE = 1920
 
 
-def _compute_body_hist(local_path: str, fx: int, fy: int, fw: int, fh: int) -> bytes | None:
-    """Compute HSV histogram of the approximate body region below a face bbox."""
-    img_bgr = cv2.imread(local_path)
-    if img_bgr is None:
+def _cosine(a_bytes: bytes, b_bytes: bytes) -> float:
+    a = np.frombuffer(a_bytes, dtype=np.float32)
+    b = np.frombuffer(b_bytes, dtype=np.float32)
+    denom = float(np.linalg.norm(a) * np.linalg.norm(b))
+    return float(np.dot(a, b)) / denom if denom > 0 else 0.0
+
+
+def _compute_body_embedding(local_path: str, fx: int, fy: int, fw: int, fh: int) -> bytes | None:
+    """SigLIP2-embed the approximate body region below a face bbox (detection space)."""
+    from utils.image import open_for_processing
+    from pipeline.scene import get_encoder
+    import torch
+
+    try:
+        img = np.array(open_for_processing(Path(local_path), _DET_LONG_SIDE))
+    except Exception:
         return None
-    h_img, w_img = img_bgr.shape[:2]
+    h_img, w_img = img.shape[:2]
     fx, fy, fw, fh = int(fx), int(fy), int(fw), int(fh)
     bx = max(0, fx - fw // 2)
     by = min(fy, h_img - 1)
@@ -52,19 +62,24 @@ def _compute_body_hist(local_path: str, fx: int, fy: int, fw: int, fh: int) -> b
     bh = min(h_img - by, fh * 4)
     if bw <= 0 or bh <= 0:
         return None
-    region = img_bgr[by:by + bh, bx:bx + bw]
+    region = img[by:by + bh, bx:bx + bw]
     if region.size == 0:
         return None
-    hsv = cv2.cvtColor(region, cv2.COLOR_BGR2HSV)
-    hist = cv2.calcHist([hsv], [0, 1, 2], None, [32, 32, 32], [0, 180, 0, 256, 0, 256])
-    cv2.normalize(hist, hist, norm_type=cv2.NORM_L2)
-    return hist.flatten().astype(np.float32).tobytes()
+
+    model, preprocess, _, device = get_encoder()
+    with torch.no_grad():
+        feat = model.encode_image(preprocess(Image.fromarray(region)).unsqueeze(0).to(device))
+        feat = feat / feat.norm(dim=-1, keepdim=True)
+    return feat.cpu().numpy().astype(np.float32).tobytes()
 
 
 def _make_body_crop(local_path: str, bx: int, by: int, bw: int, bh: int, max_w: int = 300) -> bytes:
-    """Crop body bbox from photo with padding, return JPEG bytes."""
+    """Crop body bbox (detection-space coords) from the original photo, return JPEG bytes."""
     img = Image.open(local_path)
     img = ImageOps.exif_transpose(img)
+    # detection space → original pixels
+    scale = min(_DET_LONG_SIDE / max(img.width, img.height), 1.0)
+    bx, by, bw, bh = (int(v / scale) for v in (bx, by, bw, bh))
     pad = 12
     x1 = max(0, bx - pad)
     y1 = max(0, by - pad)
@@ -208,8 +223,10 @@ def dismiss_outfit_match(trip_id: str, um_id: str, session: Session = Depends(ge
 
 # ── Misclassification detection ─────────────────────────────────────────────────
 
-MISCLASSIFY_SIMILARITY_THRESHOLD = 0.55
-MISCLASSIFY_MARGIN = 0.12
+# SigLIP2 outfit-embedding cosine thresholds (image↔image sims run higher
+# than the old HSV histogram correlations)
+MISCLASSIFY_SIMILARITY_THRESHOLD = 0.60
+MISCLASSIFY_MARGIN = 0.08
 
 
 @router.post("/{trip_id}/detect-misclassifications")
@@ -236,7 +253,7 @@ def detect_misclassifications(
 
     valid_person_ids = {row[0] for row in session.query(Person.id).all()}
     outfit_map: dict[str, bytes] = {
-        o.person_id: o.hsv_histogram for o in outfits if o.person_id in valid_person_ids
+        o.person_id: o.outfit_embedding for o in outfits if o.person_id in valid_person_ids
     }
 
     face_rows = (
@@ -258,16 +275,16 @@ def detect_misclassifications(
         if fo.person_id not in outfit_map:
             continue
 
-        body_hist = _compute_body_hist(photo.local_path, fo.bbox_x, fo.bbox_y, fo.bbox_w, fo.bbox_h)
-        if body_hist is None:
+        body_emb = _compute_body_embedding(photo.local_path, fo.bbox_x, fo.bbox_y, fo.bbox_w, fo.bbox_h)
+        if body_emb is None:
             continue
 
-        current_sim = _hist_cosine(body_hist, outfit_map[fo.person_id])
+        current_sim = _cosine(body_emb, outfit_map[fo.person_id])
         best_pid, best_sim = None, current_sim
-        for pid, ohist in outfit_map.items():
+        for pid, oemb in outfit_map.items():
             if pid == fo.person_id:
                 continue
-            sim = _hist_cosine(body_hist, ohist)
+            sim = _cosine(body_emb, oemb)
             if sim > best_sim:
                 best_sim, best_pid = sim, pid
 

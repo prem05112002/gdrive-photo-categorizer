@@ -141,7 +141,7 @@ class PersonOutfit(Base):
     person_id = Column(String, ForeignKey("persons.id"), nullable=False)
     trip_id = Column(String, ForeignKey("trips.id"), nullable=False)
     date = Column(String, nullable=False)       # ISO date string (YYYY-MM-DD)
-    hsv_histogram = Column(LargeBinary, nullable=False)  # 32³ float32 histogram bytes
+    outfit_embedding = Column(LargeBinary, nullable=False)  # SigLIP2 person-crop embedding (float32, L2-normed)
     photo_count = Column(Integer, default=1)
     updated_at = Column(DateTime, default=datetime.utcnow)
 
@@ -152,11 +152,11 @@ class UnmatchedPerson(Base):
     id = Column(String, primary_key=True, default=_uuid)
     photo_id = Column(String, ForeignKey("photos.id"))
     trip_id = Column(String, ForeignKey("trips.id"), nullable=False)
-    bbox_x = Column(Integer)
+    bbox_x = Column(Integer)          # detection space (1920 long side) — same as face bboxes
     bbox_y = Column(Integer)
     bbox_w = Column(Integer)
     bbox_h = Column(Integer)
-    hsv_histogram = Column(LargeBinary)
+    outfit_embedding = Column(LargeBinary)  # SigLIP2 person-crop embedding (float32, L2-normed)
     suggested_person_id = Column(String, ForeignKey("persons.id"))
     suggestion_confidence = Column(Float)
     status = Column(String, default="pending_review")   # pending_review | assigned | dismissed

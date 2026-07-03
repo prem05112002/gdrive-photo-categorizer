@@ -50,7 +50,7 @@ def _device() -> str:
     return "mps" if torch.backends.mps.is_available() else "cpu"
 
 
-def _get_model():
+def get_encoder():
     """Lazy singleton: (model, preprocess, per-label text features)."""
     global _model
     if _model is None:
@@ -105,7 +105,7 @@ def classify_scenes(
     if not no_face:
         return 0
 
-    model, preprocess, text_feats, device = _get_model()
+    model, preprocess, text_feats, device = get_encoder()
     total = len(no_face)
     labeled = 0
 
