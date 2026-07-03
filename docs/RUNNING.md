@@ -130,15 +130,16 @@ npm run dev
 
 ## Current build status
 
-> Last updated: Phase 5 complete — fully functional
+> Last updated: 2026-07-03 — v2 optimization pass complete (see [`CHANGELOG-v2.md`](CHANGELOG-v2.md))
 
 | Phase | Status | What it covers |
 |---|---|---|
-| **Phase 0 — Foundation** | ✅ Done + tested | Drive ingestion, dedup, RAW/video handling, basic UI |
-| **Phase 1 — Face Pipeline** | ✅ Done + tested | InsightFace buffalo_l, CoreML EP, 512-dim embeddings, face crops |
-| **Phase 2 — Enrollment** | ✅ Done + tested | DBSCAN clustering, group photo surfacing, roster UI, name/dismiss flow |
-| **Phase 3 — Classification** | ✅ Done + tested | FAISS face matching, OpenCLIP scene labels, Drive shortcut upload |
+| **Phase 0 — Foundation** | ✅ Done + tested | Drive ingestion (12-way parallel, md5 pre-dedupe, resumable), RAW/video handling, basic UI |
+| **Phase 1 — Face Pipeline** | ✅ Done + tested | InsightFace buffalo_l, CoreML EP, 512-dim embeddings, face crops, quality gate |
+| **Phase 2 — Enrollment** | ✅ Done + tested | Two-stage clustering (agglomerative + singleton attachment), suggestion chips, roster UI |
+| **Phase 3 — Classification** | ✅ Done + tested | numpy registry matching with margin rule, SigLIP 2 scene labels, parallel Drive shortcut upload |
 | **Phase 4 — Review** | ✅ Done + tested | `/review` page: persons + scenes + Misc viewer with assign/create |
 | **Phase 5 — Polish** | ✅ Done | Error persistence, retry from failures, delete trip, idempotent re-upload, status labels |
+| **v2 — Optimization** | ✅ Done, ⏳ pending end-to-end verification | All of the above rewritten for speed/accuracy; DB wiped; blocked on Google OAuth re-consent |
 
-The app is fully functional end-to-end.
+The app is fully functional end-to-end. The v2 rewrite still needs one full real-trip run to validate the new tuning thresholds.
