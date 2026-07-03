@@ -87,6 +87,7 @@ class Photo(Base):
     is_duplicate = Column(Boolean, default=False)
     duplicate_of_id = Column(String, ForeignKey("photos.id"))
     perceptual_hash = Column(String)
+    md5_checksum = Column(String)          # from Drive files.list — exact-dup detection pre-download
     face_count = Column(Integer, default=0)
     is_group_photo = Column(Boolean, default=False)
     scene_label = Column(String)           # beach | temple | mountain | city | indoor | other

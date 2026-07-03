@@ -56,6 +56,39 @@ def compute_phash(path: Path) -> Optional[str]:
         return None
 
 
+def phash_and_exif(path: Path) -> tuple[Optional[str], Optional[datetime], Optional[str]]:
+    """Compute pHash + EXIF (timestamp, device) with a single image decode."""
+    try:
+        img = Image.open(path)
+    except Exception:
+        return None, None, None
+
+    phash: Optional[str] = None
+    try:
+        phash = str(imagehash.phash(img))
+    except Exception:
+        pass
+
+    dt: Optional[datetime] = None
+    device: Optional[str] = None
+    try:
+        raw_exif = img._getexif()  # type: ignore[attr-defined]
+        if raw_exif:
+            raw_dt = raw_exif.get(_EXIF_DATETIME_ORIGINAL)
+            raw_device = raw_exif.get(_EXIF_CAMERA_MODEL)
+            if raw_dt:
+                try:
+                    dt = datetime.strptime(raw_dt, "%Y:%m:%d %H:%M:%S")
+                except ValueError:
+                    pass
+            if raw_device:
+                device = str(raw_device).strip()
+    except Exception:
+        pass
+
+    return phash, dt, device
+
+
 def extract_exif(path: Path) -> tuple[Optional[datetime], Optional[str]]:
     try:
         img = Image.open(path)
