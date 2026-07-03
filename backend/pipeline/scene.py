@@ -109,10 +109,15 @@ def classify_scenes(
     total = len(no_face)
     labeled = 0
 
-    def load(photo) -> Optional[torch.Tensor]:
+    # Snapshot paths before the loop — the per-batch commit expires ORM
+    # attributes, and decode threads must never trigger a lazy reload on the
+    # shared (non-thread-safe) session.
+    paths = {p.id: p.local_path for p in no_face}
+
+    def load(path: Optional[str]) -> Optional[torch.Tensor]:
         try:
-            if photo.local_path and Path(photo.local_path).exists():
-                img = Image.open(photo.local_path).convert("RGB")
+            if path and Path(path).exists():
+                img = Image.open(path).convert("RGB")
                 return preprocess(img)
         except Exception:
             pass
@@ -121,7 +126,7 @@ def classify_scenes(
     with ThreadPoolExecutor(max_workers=DECODE_WORKERS) as pool:
         for start in range(0, total, BATCH_SIZE):
             batch = no_face[start:start + BATCH_SIZE]
-            tensors = list(pool.map(load, batch))
+            tensors = list(pool.map(load, [paths[p.id] for p in batch]))
 
             valid = [(p, t) for p, t in zip(batch, tensors) if t is not None]
             for photo, t in zip(batch, tensors):

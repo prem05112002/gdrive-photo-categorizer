@@ -132,25 +132,30 @@ def _face_quality(img: np.ndarray, x1: int, y1: int, x2: int, y2: int,
     return blur, low
 
 
-def _decoded_stream(photos: list):
+def _decoded_stream(items: list[tuple[str, str]]):
     """
-    Yield (photo, img_or_None) with decode/resize running DECODE_WORKERS ahead
-    on background threads, so the detector never waits on image I/O.
+    Yield (photo_id, img_or_None) with decode/resize running DECODE_WORKERS
+    ahead on background threads, so the detector never waits on image I/O.
+
+    items are plain (photo_id, local_path) tuples — worker threads must never
+    touch ORM objects: session.commit() expires attributes, and the resulting
+    lazy reload would hit the (non-thread-safe) session from another thread.
     """
-    def load(photo):
-        path = Path(photo.local_path)
+    def load(path_str: str):
+        path = Path(path_str)
         return _load_image(path) if path.exists() else None
 
     with ThreadPoolExecutor(max_workers=DECODE_WORKERS) as pool:
-        it = iter(photos)
+        it = iter(items)
         queue = deque(
-            (p, pool.submit(load, p)) for p in itertools.islice(it, DECODE_WORKERS * 2)
+            (pid, pool.submit(load, path))
+            for pid, path in itertools.islice(it, DECODE_WORKERS * 2)
         )
         while queue:
-            photo, fut = queue.popleft()
-            for nxt in itertools.islice(it, 1):
-                queue.append((nxt, pool.submit(load, nxt)))
-            yield photo, fut.result()
+            photo_id, fut = queue.popleft()
+            for pid, path in itertools.islice(it, 1):
+                queue.append((pid, pool.submit(load, path)))
+            yield photo_id, fut.result()
 
 
 # ── Main pipeline ─────────────────────────────────────────────────────────────
@@ -183,8 +188,12 @@ def run_face_pipeline(trip_id: str) -> None:
 
         model = get_model()  # downloads buffalo_l on first run (~235 MB)
 
+        # Snapshot plain values before any commits — ORM objects must not be
+        # shared with the decode threads (see _decoded_stream docstring)
+        items = [(p.id, p.local_path) for p in photos]
+
         # Idempotent re-run: drop unassigned observations from any earlier run
-        photo_ids = [p.id for p in photos]
+        photo_ids = [pid for pid, _ in items]
         if photo_ids:
             session.query(FaceObservation).filter(
                 FaceObservation.photo_id.in_(photo_ids),
@@ -199,7 +208,7 @@ def run_face_pipeline(trip_id: str) -> None:
         low_quality_count = 0
         since_commit = 0
 
-        for idx, (photo, img) in enumerate(_decoded_stream(photos)):
+        for idx, (photo_id, img) in enumerate(_decoded_stream(items)):
             if img is None:
                 _update(trip_id, processed=idx + 1)
                 continue
@@ -209,7 +218,7 @@ def run_face_pipeline(trip_id: str) -> None:
             is_group = face_count >= GROUP_PHOTO_MIN_FACES
 
             # Update photo stats
-            session.query(Photo).filter(Photo.id == photo.id).update({
+            session.query(Photo).filter(Photo.id == photo_id).update({
                 "face_count": face_count,
                 "is_group_photo": is_group,
             })
@@ -223,7 +232,7 @@ def run_face_pipeline(trip_id: str) -> None:
 
                 obs = FaceObservation(
                     id=str(uuid.uuid4()),
-                    photo_id=photo.id,
+                    photo_id=photo_id,
                     raw_embedding=face.normed_embedding.astype(np.float32).tobytes(),  # L2-normalized, norm≈1.0
                     bbox_x=int(x1),
                     bbox_y=int(y1),
