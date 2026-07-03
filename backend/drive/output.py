@@ -1,14 +1,28 @@
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Callable
 
-from database.models import SessionLocal, Photo, FaceObservation, Person, TripPerson, Trip, UserCorrection
+from database.models import SessionLocal, Photo, FaceObservation, Person, TripPerson, Trip
 from database import crud
+
+UPLOAD_WORKERS = 10   # parallel shortcut creation — Drive write quota tolerates this
 
 _upload_progress: dict[str, dict] = {}
 
 
 def get_upload_progress(trip_id: str) -> dict | None:
     return _upload_progress.get(trip_id)
+
+
+# googleapiclient service objects are not thread-safe — one per worker thread.
+_tls = threading.local()
+
+
+def _thread_service():
+    from drive.auth import get_drive_service
+    if getattr(_tls, "service", None) is None:
+        _tls.service = get_drive_service()
+    return _tls.service
 
 
 # ── Drive helpers ───────────────────────────────────────────────────────────────
@@ -48,14 +62,20 @@ def get_or_create_shortcut(service, target_file_id: str, name: str, parent_folde
 
 
 def get_or_create_folder(service, name: str, parent_id: str) -> str:
+    folder_id, _ = _get_or_create_folder(service, name, parent_id)
+    return folder_id
+
+
+def _get_or_create_folder(service, name: str, parent_id: str) -> tuple[str, bool]:
+    """Returns (folder_id, created) — created=False means it already existed."""
     resp = service.files().list(
         q=f"name='{name}' and '{parent_id}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false",
         fields="files(id)",
     ).execute()
     files = resp.get("files", [])
     if files:
-        return files[0]["id"]
-    return create_folder(service, name, parent_id)
+        return files[0]["id"], False
+    return create_folder(service, name, parent_id), True
 
 
 # ── Output builder ──────────────────────────────────────────────────────────────
@@ -71,6 +91,11 @@ def build_trip_output(
     with per-person shortcuts, Places/{label}/ shortcuts, RAW shortcuts, and
     Misc shortcuts for photos with unmatched faces.
 
+    Plans the full shortcut worklist from the DB first, then creates shortcuts
+    in parallel. Existence checks (1 extra API call per shortcut) only run when
+    the [Organized] folder already existed — a fresh output tree can't have
+    collisions.
+
     Returns (shortcuts_created, root_folder_id).
     """
     trip = session.query(Trip).filter(Trip.id == trip_id).first()
@@ -83,9 +108,10 @@ def build_trip_output(
         if p:
             persons[tp.person_id] = p
 
-    root_id = get_or_create_folder(service, "[Organized]", trip.drive_folder_id)
+    root_id, root_created = _get_or_create_folder(service, "[Organized]", trip.drive_folder_id)
+    safe_mode = not root_created  # re-run into an existing tree → dedupe checks needed
 
-    # Pre-create person folders
+    # ── Plan: folders needed + one worklist item per shortcut ──────────────
     person_folders: dict[str, str] = {
         pid: get_or_create_folder(service, person.name, root_id)
         for pid, person in persons.items()
@@ -95,27 +121,21 @@ def build_trip_output(
     place_sub: dict[str, str] = {}
     misc_id: str | None = None
     raw_id: str | None = None
-    shortcuts = 0
 
-    for i, photo in enumerate(photos):
+    worklist: list[dict] = []  # {file_id, name, parent_id, pid?, photo_id}
+
+    for photo in photos:
         fname = photo.drive_file_name or f"file_{photo.id}"
-        if progress_callback:
-            progress_callback(i + 1, len(photos), fname)
 
-        if photo.is_video:
+        if photo.is_video or photo.is_duplicate:
             continue
 
         if photo.is_raw:
             if raw_id is None:
                 raw_id = get_or_create_folder(service, "RAW", root_id)
-            get_or_create_shortcut(service, photo.drive_file_id, fname, raw_id)
-            shortcuts += 1
+            worklist.append({"file_id": photo.drive_file_id, "name": fname,
+                             "parent_id": raw_id, "pid": None, "photo_id": photo.id})
             continue
-
-        if photo.is_duplicate:
-            continue
-
-        faces = session.query(FaceObservation).filter(FaceObservation.photo_id == photo.id).all()
 
         if photo.face_count == 0:
             label = photo.scene_label or "other"
@@ -123,28 +143,56 @@ def build_trip_output(
                 places_id = get_or_create_folder(service, "Places", root_id)
             if label not in place_sub:
                 place_sub[label] = get_or_create_folder(service, label, places_id)
-            get_or_create_shortcut(service, photo.drive_file_id, fname, place_sub[label])
-            shortcuts += 1
+            worklist.append({"file_id": photo.drive_file_id, "name": fname,
+                             "parent_id": place_sub[label], "pid": None, "photo_id": photo.id})
             continue
 
+        faces = session.query(FaceObservation).filter(FaceObservation.photo_id == photo.id).all()
         named_pids = {f.person_id for f in faces if f.person_id}
         has_unmatched = any(not f.person_id and not f.is_stranger for f in faces)
 
         for pid in named_pids:
             if pid in person_folders:
-                shortcut_id = get_or_create_shortcut(service, photo.drive_file_id, fname, person_folders[pid])
-                shortcuts += 1
-                session.query(FaceObservation).filter(
-                    FaceObservation.photo_id == photo.id,
-                    FaceObservation.person_id == pid,
-                ).update({"drive_shortcut_id": shortcut_id})
+                worklist.append({"file_id": photo.drive_file_id, "name": fname,
+                                 "parent_id": person_folders[pid], "pid": pid, "photo_id": photo.id})
 
         if has_unmatched:
             if misc_id is None:
                 misc_id = get_or_create_folder(service, "Misc", root_id)
-            get_or_create_shortcut(service, photo.drive_file_id, fname, misc_id)
-            shortcuts += 1
+            worklist.append({"file_id": photo.drive_file_id, "name": fname,
+                             "parent_id": misc_id, "pid": None, "photo_id": photo.id})
 
+    # ── Execute: parallel shortcut creation ────────────────────────────────
+    total = len(worklist)
+    shortcuts = 0
+    done = 0
+
+    def make(item: dict) -> str:
+        svc = _thread_service()
+        if safe_mode:
+            return get_or_create_shortcut(svc, item["file_id"], item["name"], item["parent_id"])
+        return create_shortcut(svc, item["file_id"], item["name"], item["parent_id"])
+
+    with ThreadPoolExecutor(max_workers=UPLOAD_WORKERS) as pool:
+        futures = {pool.submit(make, item): item for item in worklist}
+        for fut in as_completed(futures):
+            item = futures[fut]
+            done += 1
+            if progress_callback:
+                progress_callback(done, total, item["name"])
+            try:
+                shortcut_id = fut.result()
+            except Exception as e:
+                print(f"[upload] warning {item['name']}: {e}")
+                continue
+            shortcuts += 1
+            if item["pid"]:
+                session.query(FaceObservation).filter(
+                    FaceObservation.photo_id == item["photo_id"],
+                    FaceObservation.person_id == item["pid"],
+                ).update({"drive_shortcut_id": shortcut_id}, synchronize_session=False)
+
+    session.commit()
     return shortcuts, root_id
 
 
