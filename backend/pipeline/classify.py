@@ -1,10 +1,5 @@
-import json
-import subprocess
-import sys
 import threading
-from pathlib import Path
 
-import faiss
 import numpy as np
 
 from database.models import (
@@ -12,112 +7,95 @@ from database.models import (
 )
 from database import crud
 
-_classify_progress: dict[str, dict] = {}
+# Face → person matching. Embeddings are L2-normalized so inner product =
+# cosine similarity. Brute-force numpy is exact and instant at this scale
+# (hundreds of registry embeddings) — FAISS was removed both as overkill and
+# because its bundled libomp segfaulted against PyTorch on macOS ARM64,
+# forcing scene classification into a subprocess.
+MATCH_THRESHOLD = 0.50   # best person similarity must reach this
+MATCH_MARGIN = 0.10      # ...and beat the runner-up person by this (lookalike guard)
 
-_WORKER = Path(__file__).parent / "scene_classify_worker.py"
+_classify_progress: dict[str, dict] = {}
 
 
 def get_classify_progress(trip_id: str) -> dict | None:
     return _classify_progress.get(trip_id)
 
 
+def _match_faces(session, trip_id: str) -> int:
+    """Match unassigned faces against the full person registry. Returns count matched."""
+    emb_rows = session.query(PersonEmbedding).all()
+    if not emb_rows:
+        return 0
+
+    embs = np.stack([np.frombuffer(r.embedding, dtype=np.float32) for r in emb_rows])  # (N, 512)
+    pids = [r.person_id for r in emb_rows]
+
+    unassigned = (
+        session.query(FaceObservation)
+        .join(Photo, Photo.id == FaceObservation.photo_id)
+        .filter(
+            Photo.trip_id == trip_id,
+            FaceObservation.person_id.is_(None),
+            FaceObservation.is_stranger == False,
+            FaceObservation.raw_embedding.isnot(None),
+        )
+        .all()
+    )
+    if not unassigned:
+        return 0
+
+    faces = np.stack([np.frombuffer(f.raw_embedding, dtype=np.float32) for f in unassigned])  # (M, 512)
+    sims = faces @ embs.T  # (M, N) cosine similarities, one matmul for the whole trip
+
+    # Collapse embedding columns to per-person max similarity → (M, P)
+    unique_pids = sorted(set(pids))
+    cols = {pid: [i for i, p in enumerate(pids) if p == pid] for pid in unique_pids}
+    per_person = np.stack([sims[:, cols[pid]].max(axis=1) for pid in unique_pids], axis=1)
+
+    trip_pid_set = {
+        tp.person_id
+        for tp in session.query(TripPerson).filter(TripPerson.trip_id == trip_id)
+    }
+
+    matched = 0
+    for i, face in enumerate(unassigned):
+        row = per_person[i]
+        best_idx = int(row.argmax())
+        best = float(row[best_idx])
+        runner_up = float(np.partition(row, -2)[-2]) if len(row) > 1 else -1.0
+
+        if best >= MATCH_THRESHOLD and best - runner_up >= MATCH_MARGIN:
+            pid = unique_pids[best_idx]
+            face.person_id = pid
+            if pid not in trip_pid_set:
+                session.add(TripPerson(trip_id=trip_id, person_id=pid))
+                trip_pid_set.add(pid)
+            matched += 1
+
+    session.commit()
+    return matched
+
+
 def _run_classify(trip_id: str) -> None:
     session = SessionLocal()
     try:
+        # ── 1. Face matching (numpy, exact) ────────────────────────────────
         _classify_progress[trip_id] = {"status": "running", "step": "face_match"}
+        faces_matched = _match_faces(session, trip_id)
 
-        # ── 1. FAISS: match any unassigned faces against full registry ─────────
-        emb_rows = session.query(PersonEmbedding).all()
-        faces_matched = 0
+        # ── 2. Scene-label no-face photos (SigLIP 2, in-process) ──────────
+        _classify_progress[trip_id] = {"status": "running", "step": "loading_scene_model"}
 
-        if emb_rows:
-            embs = np.array([np.frombuffer(r.embedding, dtype=np.float32) for r in emb_rows])
-            index = faiss.IndexFlatIP(512)
-            index.add(embs)
-            pid_map = [r.person_id for r in emb_rows]
+        from pipeline.scene import classify_scenes
 
-            trip_pid_set = {
-                tp.person_id
-                for tp in session.query(TripPerson).filter(TripPerson.trip_id == trip_id)
-            }
-
-            unassigned = (
-                session.query(FaceObservation)
-                .join(Photo, Photo.id == FaceObservation.photo_id)
-                .filter(
-                    Photo.trip_id == trip_id,
-                    FaceObservation.person_id.is_(None),
-                    FaceObservation.is_stranger == False,
-                    FaceObservation.raw_embedding.isnot(None),
-                )
-                .all()
-            )
-
-            for face in unassigned:
-                emb = np.frombuffer(face.raw_embedding, dtype=np.float32).reshape(1, -1)
-                D, I = index.search(emb, k=1)
-                if float(D[0][0]) >= 0.5:
-                    best_pid = pid_map[int(I[0][0])]
-                    face.person_id = best_pid
-                    if best_pid not in trip_pid_set:
-                        session.add(TripPerson(trip_id=trip_id, person_id=best_pid))
-                        trip_pid_set.add(best_pid)
-                    faces_matched += 1
-
-            session.commit()
-
-        # ── 2. OpenCLIP: scene-label no-face photos via subprocess ────────────
-        # FAISS and PyTorch both ship libomp.dylib. Loading both in the same
-        # process causes a SIGSEGV on macOS ARM64. Run scene classification
-        # in a fresh subprocess where FAISS is never imported.
-        no_face_count = (
-            session.query(Photo)
-            .filter(
-                Photo.trip_id == trip_id,
-                Photo.face_count == 0,
-                Photo.is_raw == False,
-                Photo.is_video == False,
-                Photo.is_duplicate == False,
-            )
-            .count()
-        )
-
-        scenes_labeled = 0
-        if no_face_count > 0:
-            _classify_progress[trip_id] = {
-                "status": "running", "step": "loading_scene_model",
-            }
-
-            proc = subprocess.Popen(
-                [sys.executable, str(_WORKER), trip_id],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                cwd=str(Path(__file__).parent.parent),
-            )
-
+        def on_progress(done: int, total: int) -> None:
             _classify_progress[trip_id] = {
                 "status": "running", "step": "scene_classify",
-                "scene_total": no_face_count, "scene_processed": 0,
+                "scene_total": total, "scene_processed": done,
             }
 
-            for line in proc.stdout:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    data = json.loads(line)
-                    if "progress" in data:
-                        _classify_progress[trip_id]["scene_processed"] = data["progress"] + 1
-                    if "labeled" in data:
-                        scenes_labeled = data["labeled"]
-                except Exception:
-                    pass
-
-            proc.wait()
-            if proc.returncode != 0:
-                stderr = proc.stderr.read()
-                raise RuntimeError(f"Scene classification subprocess failed: {stderr}")
+        scenes_labeled = classify_scenes(session, trip_id, on_progress)
 
         session.expire_all()
         session.query(Trip).filter(Trip.id == trip_id).update({"status": "classified"})

@@ -24,7 +24,12 @@ numpy>=1.26.0
 opencv-python-headless>=4.10.0
 scikit-learn>=1.5.0
 
-# Phase 3 — classification + Drive output
-faiss-cpu>=1.8.0
+# Classification + Drive output
+# (faiss removed: numpy matmul is exact at registry scale and avoids the
+#  libomp SIGSEGV against PyTorch on macOS ARM64)
 open-clip-torch>=3.3.0
 torch>=2.3.0
+transformers>=4.44.0   # SigLIP2 tokenizer backend for open_clip
+
+# Body detection
+ultralytics>=8.4.0
