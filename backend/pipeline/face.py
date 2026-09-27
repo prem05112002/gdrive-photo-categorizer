@@ -76,7 +76,14 @@ def _init_model():
         providers = ["CPUExecutionProvider"]
         print("[face] CoreML not available — using CPU")
 
-    app = FaceAnalysis(name="buffalo_l", providers=providers)
+    # Only the detector + ArcFace recognizer are used. Left unrestricted,
+    # InsightFace also loads and runs the 3d68/2d106 landmark and gender/age
+    # models on every face for nothing (~30% CPU time, ~150 MB of weights).
+    app = FaceAnalysis(
+        name="buffalo_l",
+        providers=providers,
+        allowed_modules=["detection", "recognition"],
+    )
     # det_size=(640,640) is the standard input size for buffalo_l detector
     app.prepare(ctx_id=0, det_size=(640, 640))
     return app
@@ -213,7 +220,11 @@ def run_face_pipeline(trip_id: str) -> None:
                 _update(trip_id, processed=idx + 1)
                 continue
 
-            faces = model.get(img)
+            # InsightFace's model zoo is written for cv2 (BGR) input and swaps
+            # channels internally (swapRB=True). Feeding RGB shifts every
+            # embedding (measured: cos(RGB, BGR) ≈ 0.88 for the same face).
+            # Convert for the model only — crops and blur scores stay RGB.
+            faces = model.get(cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
             face_count = len(faces)
             is_group = face_count >= GROUP_PHOTO_MIN_FACES
 

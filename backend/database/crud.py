@@ -51,6 +51,7 @@ def update_trip_status(session: Session, trip_id: str, status: str) -> None:
     update: dict = {"status": status}
     if status != "failed":
         update["last_good_status"] = status
+        update["error_message"] = None  # a step completed — drop any stale failure text
     session.query(Trip).filter(Trip.id == trip_id).update(update)
     session.commit()
 

@@ -43,6 +43,11 @@ Full-pipeline speed + accuracy overhaul. Five commits on `v2`:
 
 **Schema:** `face_observations.blur_score`, `face_observations.is_low_quality` added.
 
+**Follow-up (2026-09-27):**
+- **RGB→BGR fix.** `_load_image` yields RGB (PIL), but InsightFace's model zoo is written for cv2 input and swaps channels itself (`swapRB=True` in both `retinaface.py` and `arcface_onnx.py`), so the detector and ArcFace were seeing swapped channels. Now `cv2.cvtColor(img, COLOR_RGB2BGR)` is applied for the model only; face crops and blur scores stay RGB. Measured on the Kochi trip (1139 photos): the six dominant people clustered as `209/144/125/111/92/92` faces plus `32/23`-face fragments before, `220/147/129/125/122/117` after with the next cluster at 11 — same intra-cluster cosine (≈0.68) at larger sizes, 27 → 16 suggested singletons. Faces detected 1291 → 1327 (the detector input changed too).
+- **`allowed_modules=["detection", "recognition"]`** — the 3d68/2d106 landmark and gender/age sub-models were loaded and run on every face for nothing (~30% CPU time, ~150 MB of weights). Nothing reads their outputs.
+- `crud.update_trip_status` now clears `error_message` on any non-failed transition, so a trip that recovered from a crash no longer carries the stale failure text.
+
 ---
 
 ## 3. Clustering (`backend/enrollment/cluster.py`)
