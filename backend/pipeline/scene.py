@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 import torch
-from PIL import Image
+from PIL import Image, ImageOps
 import pillow_heif
 
 from database.models import Photo
@@ -117,7 +117,7 @@ def classify_scenes(
     def load(path: Optional[str]) -> Optional[torch.Tensor]:
         try:
             if path and Path(path).exists():
-                img = Image.open(path).convert("RGB")
+                img = ImageOps.exif_transpose(Image.open(path)).convert("RGB")
                 return preprocess(img)
         except Exception:
             pass

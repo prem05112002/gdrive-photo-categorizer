@@ -9,7 +9,7 @@ from typing import Optional
 
 import cv2
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageOps
 import pillow_heif
 
 from database.models import SessionLocal, Photo, FaceObservation
@@ -92,9 +92,17 @@ def _init_model():
 # ── Image helpers ─────────────────────────────────────────────────────────────
 
 def _load_image(path: Path) -> Optional[np.ndarray]:
-    """Open any supported image as an RGB numpy array, resized to MAX_LONG_SIDE."""
+    """
+    Open any supported image as an RGB numpy array, resized to MAX_LONG_SIDE.
+
+    EXIF orientation is applied first, so detection space is the photo as a
+    viewer sees it. Phone JPEGs are often stored sideways with an orientation
+    tag: without this the detector saw them rotated (Kochi trip, 155 such
+    photos: 109 faces found vs 171 upright) and their bboxes lived in a
+    different coordinate space from every consumer that honours EXIF.
+    """
     try:
-        img = Image.open(path)
+        img = ImageOps.exif_transpose(Image.open(path))
         if img.mode != "RGB":
             img = img.convert("RGB")
         w, h = img.size

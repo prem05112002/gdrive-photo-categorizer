@@ -4,7 +4,7 @@ from datetime import datetime
 from typing import Optional
 
 import imagehash
-from PIL import Image
+from PIL import Image, ImageOps
 import pillow_heif
 
 pillow_heif.register_heif_opener()
@@ -117,7 +117,7 @@ def open_for_processing(path: Path, max_long_side: int = 1920) -> Image.Image:
     Resizes so the longest side is at most max_long_side — reduces memory and speeds up models.
     Returns an RGB PIL Image.
     """
-    img = Image.open(path)
+    img = ImageOps.exif_transpose(Image.open(path))  # upright — same space as face bboxes
     if img.mode not in ("RGB",):
         img = img.convert("RGB")
 
