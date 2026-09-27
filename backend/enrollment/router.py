@@ -1,5 +1,8 @@
 import base64
+from pathlib import Path
+
 from fastapi import APIRouter, Depends, HTTPException
+from PIL import Image
 from pydantic import BaseModel
 from sqlalchemy import func, distinct, text
 from sqlalchemy.orm import Session
@@ -7,14 +10,51 @@ from sqlalchemy.orm import Session
 from database.models import get_session, FaceObservation, Photo, Person, PersonEmbedding, TripPerson
 from database import crud
 from enrollment.cluster import cluster_faces, count_low_quality
+from pipeline.face import MAX_LONG_SIDE
 
 from database.models import PersonOutfit, UnmatchedPerson
 
 router = APIRouter()
 
 
+_det_dims_cache: dict[str, tuple[int, int]] = {}
+
+
+def _det_dims(local_path: str | None) -> tuple[int, int] | None:
+    """
+    (width, height) of a photo as the face pipeline saw it: EXIF-upright with
+    the long side capped at MAX_LONG_SIDE. Header-only read, cached per path.
+    Face bboxes are stored in this space, so the UI can place them as
+    percentages of the rendered photo.
+    """
+    if not local_path:
+        return None
+    cached = _det_dims_cache.get(local_path)
+    if cached:
+        return cached
+    path = Path(local_path)
+    if not path.exists():
+        return None
+    try:
+        with Image.open(path) as img:
+            w, h = img.size
+            if img.getexif().get(0x0112, 1) in (5, 6, 7, 8):  # EXIF orientation: 90° rotations
+                w, h = h, w
+    except Exception:
+        return None
+    scale = min(MAX_LONG_SIDE / max(w, h), 1.0)
+    dims = (int(w * scale), int(h * scale))
+    _det_dims_cache[local_path] = dims
+    return dims
+
+
 @router.get("/{trip_id}/group-photos")
 def get_group_photos(trip_id: str, session: Session = Depends(get_session)):
+    """
+    Reference shots for enrollment: every group photo (face_count ≥ 5), largest
+    first, with all of its faces as detection-space boxes so the UI can draw
+    them on the photo and link each one to its cluster or already-named person.
+    """
     trip = crud.get_trip(session, trip_id)
     if not trip:
         raise HTTPException(404, "Trip not found")
@@ -25,21 +65,45 @@ def get_group_photos(trip_id: str, session: Session = Depends(get_session)):
         .order_by(Photo.face_count.desc())
         .all()
     )
+    if not photos:
+        return []
+
+    faces_by_photo: dict[str, list[tuple[FaceObservation, str | None]]] = {}
+    rows = (
+        session.query(FaceObservation, Person.name)
+        .outerjoin(Person, Person.id == FaceObservation.person_id)
+        .filter(FaceObservation.photo_id.in_([p.id for p in photos]))
+        .all()
+    )
+    for face, person_name in rows:
+        faces_by_photo.setdefault(face.photo_id, []).append((face, person_name))
 
     result = []
     for photo in photos:
-        faces = (
-            session.query(FaceObservation)
-            .filter(FaceObservation.photo_id == photo.id, FaceObservation.face_crop.isnot(None))
-            .order_by(FaceObservation.confidence.desc())
-            .limit(6)
-            .all()
-        )
+        dims = _det_dims(photo.local_path)
+        if dims is None:
+            continue  # file gone from the local cache — nothing to draw on
         result.append({
             "id": photo.id,
             "file_name": photo.drive_file_name,
             "face_count": photo.face_count,
-            "face_crops": [base64.b64encode(f.face_crop).decode() for f in faces],
+            "det_width": dims[0],
+            "det_height": dims[1],
+            "faces": [
+                {
+                    "face_id": face.id,
+                    "bbox_x": face.bbox_x,
+                    "bbox_y": face.bbox_y,
+                    "bbox_w": face.bbox_w,
+                    "bbox_h": face.bbox_h,
+                    "person_id": face.person_id,
+                    "person_name": person_name,
+                    "is_low_quality": bool(face.is_low_quality),
+                    "is_stranger": bool(face.is_stranger),
+                }
+                for face, person_name in faces_by_photo.get(photo.id, [])
+                if face.bbox_w is not None
+            ],
         })
 
     return result
@@ -61,15 +125,32 @@ def get_clusters(trip_id: str, session: Session = Depends(get_session)):
         .scalar()
     ) or 0
 
+    # One query for the file names behind every sample face
+    rep_photo_ids = {f.photo_id for c in clusters for f in c["representatives"]}
+    file_names: dict[str, str | None] = dict(
+        session.query(Photo.id, Photo.drive_file_name).filter(Photo.id.in_(rep_photo_ids)).all()
+    ) if rep_photo_ids else {}
+
     return {
         "clusters": [
             {
                 "cluster_id": c["cluster_id"],
                 "size": c["size"],
+                "photo_count": c["photo_count"],
                 "is_singleton": c["is_singleton"],
                 "face_ids": c["face_ids"],
-                "representative_crops": [
-                    base64.b64encode(crop).decode() for crop in c["representative_crops"]
+                "representatives": [
+                    {
+                        "face_id": f.id,
+                        "photo_id": f.photo_id,
+                        "file_name": file_names.get(f.photo_id),
+                        "bbox_x": f.bbox_x,
+                        "bbox_y": f.bbox_y,
+                        "bbox_w": f.bbox_w,
+                        "bbox_h": f.bbox_h,
+                        "crop": base64.b64encode(f.face_crop).decode(),
+                    }
+                    for f in c["representatives"]
                 ],
                 "suggested_cluster_id": c["suggested_cluster_id"],
             }

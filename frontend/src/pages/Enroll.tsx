@@ -1,8 +1,24 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useMemo, useRef } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
-import { Loader2, ChevronLeft, ChevronRight, ChevronDown, Trash2 } from 'lucide-react'
-import { api, type GroupPhoto, type FaceCluster, type EnrolledPerson } from '../api/client'
+import { Loader2, ChevronLeft, ChevronRight, ChevronDown, Trash2, X, Maximize2, ImageOff } from 'lucide-react'
+import { api, type GroupPhoto, type GroupPhotoFace, type FaceCluster, type EnrolledPerson } from '../api/client'
 import { Topbar } from '../components/Topbar'
+
+const LEFT_PANEL_WIDTH = 400
+const TOPBAR_HEIGHT = 56   // Topbar is sticky at top:0 — the reference panel sticks just below it
+const HIGHLIGHT_MS = 1800
+
+type SavedName = { name: string; personId: string }
+type FaceState = 'named' | 'pending' | 'inactive'
+type FaceLabel = { name: string | null; state: FaceState }
+type Highlight = { id: number; at: number }
+type LightboxState = { cluster: FaceCluster; index: number }
+
+// A person appears once per photo, so faces == photos almost always; only spell out both when they differ
+function countLabel(c: FaceCluster): string {
+  const photos = `${c.photo_count} photo${c.photo_count !== 1 ? 's' : ''}`
+  return c.size === c.photo_count ? photos : `${c.size} faces in ${photos}`
+}
 
 export function Enroll() {
   const { id } = useParams<{ id: string }>()
@@ -16,7 +32,7 @@ export function Enroll() {
   const [expected, setExpected]           = useState<number | null>(null)
   const [nameInputs, setNameInputs]       = useState<Record<number, string>>({})
   const [saving, setSaving]               = useState<Set<number>>(new Set())
-  const [savedNames, setSavedNames]       = useState<Record<number, { name: string; personId: string }>>({})
+  const [savedNames, setSavedNames]       = useState<Record<number, SavedName>>({})
   const [dismissed, setDismissed]         = useState<Set<number>>(new Set())
   const [lowQuality, setLowQuality]       = useState(0)
   const [showStrangers, setShowStrangers] = useState(false)
@@ -25,6 +41,10 @@ export function Enroll() {
   const [enrolledPersons, setEnrolledPersons] = useState<EnrolledPerson[]>([])
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null)
   const [deleting, setDeleting]           = useState<string | null>(null)
+  const [lightbox, setLightbox]           = useState<LightboxState | null>(null)
+  const [photoOverlay, setPhotoOverlay]   = useState(false)
+  const [highlight, setHighlight]         = useState<Highlight | null>(null)
+  const cardRefs = useRef<Record<number, HTMLDivElement | null>>({})
 
   useEffect(() => {
     if (!id) return
@@ -52,19 +72,55 @@ export function Enroll() {
     load()
   }, [id])
 
-  async function saveName(cluster: FaceCluster, nameOverride?: string) {
-    if (!id) return
+  // face_id → cluster_id, so a face clicked on a reference photo can find its roster card
+  const faceToCluster = useMemo(() => {
+    const m = new Map<string, number>()
+    for (const c of clusters) for (const f of c.face_ids) m.set(f, c.cluster_id)
+    return m
+  }, [clusters])
+
+  // Scroll to and flash the card of a cluster that was jumped to
+  useEffect(() => {
+    if (!highlight) return
+    const raf = requestAnimationFrame(() => {
+      cardRefs.current[highlight.id]?.scrollIntoView({ behavior: 'smooth', block: 'center' })
+    })
+    const t = setTimeout(() => setHighlight(null), HIGHLIGHT_MS)
+    return () => { cancelAnimationFrame(raf); clearTimeout(t) }
+  }, [highlight])
+
+  // Keyboard: Esc closes overlays, arrows move through samples / reference photos
+  useEffect(() => {
+    function onKey(e: KeyboardEvent) {
+      if (e.key === 'Escape') { setLightbox(null); setPhotoOverlay(false); return }
+      if ((e.target as HTMLElement | null)?.tagName === 'INPUT') return
+      if (lightbox) {
+        const last = lightbox.cluster.representatives.length - 1
+        if (e.key === 'ArrowLeft')  setLightbox(lb => lb && { ...lb, index: Math.max(0, lb.index - 1) })
+        if (e.key === 'ArrowRight') setLightbox(lb => lb && { ...lb, index: Math.min(last, lb.index + 1) })
+      } else if (photoOverlay) {
+        if (e.key === 'ArrowLeft')  setCarouselIdx(i => Math.max(0, i - 1))
+        if (e.key === 'ArrowRight') setCarouselIdx(i => Math.min(groupPhotos.length - 1, i + 1))
+      }
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [lightbox, photoOverlay, groupPhotos.length])
+
+  async function saveName(cluster: FaceCluster, nameOverride?: string): Promise<boolean> {
+    if (!id) return false
     const name = (nameOverride ?? nameInputs[cluster.cluster_id] ?? '').trim()
-    if (!name) return
+    if (!name) return false
     setSaving(prev => new Set(prev).add(cluster.cluster_id))
     try {
       const res = await api.enrollment.nameCluster(id, name, cluster.face_ids)
       setSavedNames(prev => ({ ...prev, [cluster.cluster_id]: { name, personId: res.person_id } }))
       setNamed(prev => prev + 1)
-      const personsData = await api.enrollment.persons(id)
-      setEnrolledPersons(personsData)
+      setEnrolledPersons(await api.enrollment.persons(id))
+      return true
     } catch (e) {
       alert(e instanceof Error ? e.message : 'Save failed')
+      return false
     } finally {
       setSaving(prev => { const s = new Set(prev); s.delete(cluster.cluster_id); return s })
     }
@@ -87,9 +143,13 @@ export function Enroll() {
       await api.enrollment.deletePerson(id, personId)
       setEnrolledPersons(prev => prev.filter(p => p.person_id !== personId))
       setNamed(prev => Math.max(0, prev - 1))
-      // Reload clusters — freed faces may now appear as pending clusters
-      const clusterData = await api.enrollment.clusters(id)
+      // Freed faces come back as pending clusters, and lose their name on the reference photos
+      const [clusterData, photosData] = await Promise.all([
+        api.enrollment.clusters(id),
+        api.enrollment.groupPhotos(id),
+      ])
       setClusters(clusterData.clusters)
+      setGroupPhotos(photosData)
     } catch (e) {
       alert(e instanceof Error ? e.message : 'Delete failed')
     } finally {
@@ -105,8 +165,7 @@ export function Enroll() {
     try {
       await api.enrollment.assignFaces(id, target.personId, cluster.face_ids)
       setSavedNames(prev => ({ ...prev, [cluster.cluster_id]: target }))
-      const personsData = await api.enrollment.persons(id)
-      setEnrolledPersons(personsData)
+      setEnrolledPersons(await api.enrollment.persons(id))
     } catch (e) {
       alert(e instanceof Error ? e.message : 'Assign failed')
     }
@@ -122,6 +181,24 @@ export function Enroll() {
         } catch { /* continue */ }
       }
     }
+  }
+
+  function faceLabel(face: GroupPhotoFace): FaceLabel {
+    if (face.person_name) return { name: face.person_name, state: 'named' }
+    const cid = faceToCluster.get(face.face_id)
+    if (cid == null || dismissed.has(cid)) return { name: null, state: 'inactive' }
+    const saved = savedNames[cid]
+    return saved ? { name: saved.name, state: 'named' } : { name: null, state: 'pending' }
+  }
+
+  function jumpToFace(face: GroupPhotoFace) {
+    const cid = faceToCluster.get(face.face_id)
+    if (cid == null || dismissed.has(cid)) return
+    const cluster = clusters.find(c => c.cluster_id === cid)
+    if (!cluster) return
+    if (cluster.is_singleton) setShowStrangers(true)
+    setPhotoOverlay(false)
+    setHighlight({ id: cid, at: Date.now() })
   }
 
   if (loading) {
@@ -151,6 +228,12 @@ export function Enroll() {
     { label: 'Enroll' },
   ]
 
+  const navBtn = (disabled: boolean): React.CSSProperties => ({
+    width: 32, height: 32, borderRadius: 8, background: 'var(--surface)', border: '1px solid var(--border)',
+    color: '#a1a1aa', display: 'flex', alignItems: 'center', justifyContent: 'center',
+    cursor: disabled ? 'default' : 'pointer', opacity: disabled ? 0.3 : 1,
+  })
+
   return (
     <div style={{ minHeight: '100vh', display: 'flex', flexDirection: 'column', background: 'var(--bg)' }}>
       <Topbar
@@ -170,43 +253,43 @@ export function Enroll() {
 
       <div style={{ display: 'flex', flex: 1 }}>
 
-        {/* ── Left: Group photo carousel ── */}
-        <div style={{ width: 300, flexShrink: 0, borderRight: '1px solid var(--border)', padding: 22, background: 'var(--bg)' }}>
+        {/* ── Left: reference photos ── */}
+        <div style={{ width: LEFT_PANEL_WIDTH, flexShrink: 0, borderRight: '1px solid var(--border)', padding: 22, background: 'var(--bg)', position: 'sticky', top: TOPBAR_HEIGHT, alignSelf: 'flex-start', maxHeight: `calc(100vh - ${TOPBAR_HEIGHT}px)`, overflowY: 'auto', boxSizing: 'border-box' }}>
 
-          <div style={{ fontSize: 12, fontWeight: 600, color: '#71717A', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 14 }}>
-            Group photos
+          <div style={{ fontSize: 12, fontWeight: 600, color: '#71717A', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 6 }}>
+            Reference photos
           </div>
+          <p style={{ fontSize: 12, color: '#71717A', lineHeight: 1.5, margin: '0 0 14px' }}>
+            Group shots from this trip, to help you tell people apart. Click a face to jump to its
+            cluster on the right — names fill in here as you enroll.
+          </p>
 
-          {groupPhotos.length > 0 && currentPhoto ? (
-            <div style={{ background: 'var(--surface)', border: '1px solid var(--border)', borderRadius: 12, padding: 14 }}>
-              <div style={{ fontSize: 12, fontFamily: 'ui-monospace, monospace', color: '#71717A', marginBottom: 10, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                {currentPhoto.file_name} · {currentPhoto.face_count} faces
-              </div>
-              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 8 }}>
-                {currentPhoto.face_crops.slice(0, 6).map((crop, i) => (
-                  <img
-                    key={i}
-                    src={`data:image/jpeg;base64,${crop}`}
-                    style={{ width: '100%', aspectRatio: '1', objectFit: 'cover', borderRadius: 8 }}
-                    alt=""
-                  />
-                ))}
+          {currentPhoto ? (
+            <div style={{ background: 'var(--surface)', border: '1px solid var(--border)', borderRadius: 12, padding: 10 }}>
+              <ReferencePhoto photo={currentPhoto} tripId={id!} labelFor={faceLabel} onFaceClick={jumpToFace} />
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 10 }}>
+                <span style={{ flex: 1, minWidth: 0, fontSize: 12, fontFamily: 'ui-monospace, monospace', color: '#71717A', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                  {currentPhoto.file_name} · {currentPhoto.face_count} faces
+                </span>
+                <button
+                  onClick={() => setPhotoOverlay(true)}
+                  title="View larger"
+                  style={{ width: 28, height: 28, borderRadius: 7, background: 'var(--bg)', border: '1px solid var(--border)', color: '#a1a1aa', display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer', flexShrink: 0 }}
+                >
+                  <Maximize2 size={13} />
+                </button>
               </div>
             </div>
           ) : (
             <div style={{ background: 'var(--surface)', border: '1px solid var(--border)', borderRadius: 12, padding: 16, textAlign: 'center' }}>
-              <p style={{ fontSize: 12, color: 'var(--text-muted)' }}>No group photos found</p>
+              <p style={{ fontSize: 12, color: 'var(--text-muted)' }}>No group photos in this trip (none with 5+ faces).</p>
             </div>
           )}
 
           {/* Carousel nav */}
           {groupPhotos.length > 1 && (
             <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginTop: 14 }}>
-              <button
-                onClick={() => setCarouselIdx(i => Math.max(0, i - 1))}
-                disabled={carouselIdx === 0}
-                style={{ width: 32, height: 32, borderRadius: 8, background: 'var(--surface)', border: '1px solid var(--border)', color: '#a1a1aa', display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer', opacity: carouselIdx === 0 ? 0.3 : 1 }}
-              >
+              <button onClick={() => setCarouselIdx(i => Math.max(0, i - 1))} disabled={carouselIdx === 0} style={navBtn(carouselIdx === 0)}>
                 <ChevronLeft size={14} />
               </button>
               {groupPhotos.length <= 10 ? (
@@ -224,11 +307,7 @@ export function Enroll() {
                   {carouselIdx + 1} / {groupPhotos.length}
                 </span>
               )}
-              <button
-                onClick={() => setCarouselIdx(i => Math.min(groupPhotos.length - 1, i + 1))}
-                disabled={carouselIdx === groupPhotos.length - 1}
-                style={{ width: 32, height: 32, borderRadius: 8, background: 'var(--surface)', border: '1px solid var(--border)', color: '#a1a1aa', display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer', opacity: carouselIdx === groupPhotos.length - 1 ? 0.3 : 1 }}
-              >
+              <button onClick={() => setCarouselIdx(i => Math.min(groupPhotos.length - 1, i + 1))} disabled={carouselIdx === groupPhotos.length - 1} style={navBtn(carouselIdx === groupPhotos.length - 1)}>
                 <ChevronRight size={14} />
               </button>
             </div>
@@ -256,17 +335,20 @@ export function Enroll() {
             <div style={{ marginBottom: 24 }}>
               <div style={{ display: 'flex', alignItems: 'baseline', gap: 10, marginBottom: 14 }}>
                 <span style={{ fontSize: 15, fontWeight: 700, color: 'var(--text-primary)' }}>Group members</span>
-                <span style={{ fontSize: 12, color: '#71717A' }}>clusters with ≥3 appearances</span>
+                <span style={{ fontSize: 12, color: '#71717A' }}>clusters with ≥3 appearances · click any face to see it in its photo</span>
               </div>
               <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
                 {groupClusters.map(cluster => (
-                  <ClusterRow
+                  <ClusterCard
                     key={cluster.cluster_id}
                     cluster={cluster}
                     value={nameInputs[cluster.cluster_id] || ''}
                     onChange={val => setNameInputs(prev => ({ ...prev, [cluster.cluster_id]: val }))}
                     onSave={() => saveName(cluster)}
+                    onOpen={index => setLightbox({ cluster, index })}
                     saving={saving.has(cluster.cluster_id)}
+                    highlighted={highlight?.id === cluster.cluster_id}
+                    cardRef={el => { cardRefs.current[cluster.cluster_id] = el }}
                   />
                 ))}
               </div>
@@ -380,6 +462,9 @@ export function Enroll() {
                         onConfirmSuggestion={() => confirmSuggestion(cluster)}
                         onDismiss={() => dismissCluster(cluster)}
                         onName={val => saveName(cluster, val)}
+                        onOpen={() => setLightbox({ cluster, index: 0 })}
+                        highlighted={highlight?.id === cluster.cluster_id}
+                        cardRef={el => { cardRefs.current[cluster.cluster_id] = el }}
                       />
                     ))}
                 </div>
@@ -402,105 +487,277 @@ export function Enroll() {
         </div>
 
       </div>
+
+      {/* ── Reference photo, large ── */}
+      {photoOverlay && currentPhoto && (
+        <div
+          style={{ position: 'fixed', inset: 0, zIndex: 50, background: 'rgba(8,8,11,.88)', display: 'flex', flexDirection: 'column' }}
+          onClick={e => { if (e.target === e.currentTarget) setPhotoOverlay(false) }}
+        >
+          <div style={{ display: 'flex', alignItems: 'center', padding: '12px 16px', gap: 12 }}>
+            <button onClick={() => setPhotoOverlay(false)} style={overlayCloseBtn}><X size={16} /></button>
+            <span style={{ fontSize: 13, color: '#a1a1aa', fontFamily: 'ui-monospace, monospace' }}>
+              {currentPhoto.file_name} · {currentPhoto.face_count} faces
+            </span>
+            <span style={{ fontSize: 12, color: '#71717A' }}>click a face to jump to its cluster</span>
+            <span style={{ marginLeft: 'auto', fontSize: 12, color: '#71717A' }}>
+              {carouselIdx + 1} / {groupPhotos.length}
+            </span>
+          </div>
+          <div
+            style={{ flex: 1, minHeight: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '0 16px' }}
+            onClick={e => { if (e.target === e.currentTarget) setPhotoOverlay(false) }}
+          >
+            <ReferencePhoto photo={currentPhoto} tripId={id!} labelFor={faceLabel} onFaceClick={jumpToFace} large />
+          </div>
+          <div style={{ display: 'flex', justifyContent: 'space-between', padding: '10px 16px' }}>
+            <button onClick={() => setCarouselIdx(i => Math.max(0, i - 1))} disabled={carouselIdx === 0} style={overlayNavBtn(carouselIdx === 0)}>
+              <ChevronLeft size={16} /> Prev
+            </button>
+            <button onClick={() => setCarouselIdx(i => Math.min(groupPhotos.length - 1, i + 1))} disabled={carouselIdx === groupPhotos.length - 1} style={overlayNavBtn(carouselIdx === groupPhotos.length - 1)}>
+              Next <ChevronRight size={16} />
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* ── Face in context ── */}
+      {lightbox && (
+        <FaceLightbox
+          cluster={lightbox.cluster}
+          index={lightbox.index}
+          savedName={savedNames[lightbox.cluster.cluster_id]?.name ?? null}
+          saving={saving.has(lightbox.cluster.cluster_id)}
+          onIndex={index => setLightbox({ cluster: lightbox.cluster, index })}
+          onClose={() => setLightbox(null)}
+          onName={async val => { if (await saveName(lightbox.cluster, val)) setLightbox(null) }}
+        />
+      )}
     </div>
   )
 }
 
-// ── Cluster row ────────────────────────────────────────────────────────────────
+const overlayCloseBtn: React.CSSProperties = {
+  background: 'rgba(255,255,255,.08)', border: 'none', borderRadius: 7, padding: '6px 10px',
+  color: '#a1a1aa', cursor: 'pointer', display: 'flex', alignItems: 'center',
+}
 
-function ClusterRow({ cluster, value, onChange, onSave, saving }: {
+const overlayNavBtn = (disabled: boolean): React.CSSProperties => ({
+  background: 'rgba(255,255,255,.06)', border: 'none', borderRadius: 7, padding: '7px 14px',
+  color: disabled ? '#71717A' : 'var(--text-primary)', cursor: disabled ? 'default' : 'pointer',
+  display: 'flex', alignItems: 'center', gap: 6, opacity: disabled ? 0.4 : 1,
+})
+
+// ── Reference photo with clickable face boxes ──────────────────────────────────
+//
+// Boxes are positioned as percentages of the photo's detection-space size, so
+// they stay put at any rendered size without measuring the image.
+
+function ReferencePhoto({ photo, tripId, labelFor, onFaceClick, large = false }: {
+  photo: GroupPhoto
+  tripId: string
+  labelFor: (face: GroupPhotoFace) => FaceLabel
+  onFaceClick: (face: GroupPhotoFace) => void
+  large?: boolean
+}) {
+  const [failedId, setFailedId] = useState<string | null>(null)   // photo whose thumbnail failed to load
+  const [hover, setHover] = useState<string | null>(null)
+  const failed = failedId === photo.id
+
+  if (failed) {
+    return (
+      <div style={{ aspectRatio: `${photo.det_width} / ${photo.det_height}`, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: 6, background: 'var(--surface-2)', borderRadius: 8, color: '#71717A', fontSize: 12, minWidth: large ? 360 : undefined }}>
+        <ImageOff size={18} />
+        Photo not in the local cache
+      </div>
+    )
+  }
+
+  const pct = (v: number, of: number) => `${(v / of) * 100}%`
+  const colorFor: Record<FaceState, string> = {
+    named: '#22C55E',
+    pending: '#7C6EF8',
+    inactive: 'rgba(255,255,255,.35)',
+  }
+
+  return (
+    <div style={{ position: 'relative', display: large ? 'inline-block' : 'block', lineHeight: 0 }}>
+      <img
+        src={api.photos.thumbnailUrl(photo.id, tripId, large ? 1200 : 800)}
+        onError={() => setFailedId(photo.id)}
+        alt=""
+        style={large
+          ? { maxWidth: '88vw', maxHeight: '78vh', display: 'block', borderRadius: 8 }
+          : { width: '100%', display: 'block', borderRadius: 8 }}
+      />
+      {photo.faces.map(face => {
+        const { name, state } = labelFor(face)
+        const clickable = state === 'pending'
+        const hovered = hover === face.face_id
+        return (
+          <div
+            key={face.face_id}
+            style={{
+              position: 'absolute', pointerEvents: 'none',
+              left: pct(face.bbox_x, photo.det_width), top: pct(face.bbox_y, photo.det_height),
+              width: pct(face.bbox_w, photo.det_width), height: pct(face.bbox_h, photo.det_height),
+            }}
+          >
+            <div
+              onClick={clickable ? () => onFaceClick(face) : undefined}
+              onMouseEnter={() => setHover(face.face_id)}
+              onMouseLeave={() => setHover(null)}
+              title={name ?? (clickable ? 'Jump to this cluster' : 'Not up for review — low quality, dismissed, or already assigned')}
+              style={{
+                position: 'absolute', inset: -3, borderRadius: 5, pointerEvents: 'auto',
+                border: `2px solid ${colorFor[state]}`,
+                cursor: clickable ? 'pointer' : 'default',
+                opacity: state === 'inactive' ? 0.55 : 1,
+                boxShadow: hovered && clickable ? '0 0 0 3px rgba(124,110,248,.4)' : '0 0 0 1px rgba(0,0,0,.45)',
+                transition: 'box-shadow .12s',
+              }}
+            />
+            {name && (
+              <span style={{
+                position: 'absolute', top: '100%', left: '50%', transform: 'translate(-50%, 5px)',
+                whiteSpace: 'nowrap', fontSize: large ? 12 : 10, fontWeight: 600, lineHeight: 1.4,
+                color: '#86efac', background: 'rgba(8,8,11,.85)', borderRadius: 4, padding: '1px 5px',
+              }}>
+                {name}
+              </span>
+            )}
+          </div>
+        )
+      })}
+    </div>
+  )
+}
+
+// ── Cluster card ───────────────────────────────────────────────────────────────
+
+function ClusterCard({ cluster, value, onChange, onSave, onOpen, saving, highlighted, cardRef }: {
   cluster: FaceCluster
   value: string
   onChange: (v: string) => void
   onSave: () => void
+  onOpen: (index: number) => void
   saving: boolean
+  highlighted: boolean
+  cardRef: (el: HTMLDivElement | null) => void
 }) {
+  const hero = cluster.representatives[0]
+  const samples = cluster.representatives.slice(1)
+
   return (
     <div
+      ref={cardRef}
       style={{
-        display: 'flex', alignItems: 'center', gap: 14,
-        background: 'var(--surface)', border: '1px solid var(--border)',
-        borderRadius: 12, padding: '12px 14px',
+        display: 'flex', gap: 16,
+        background: 'var(--surface)',
+        border: `1px solid ${highlighted ? 'var(--accent)' : 'var(--border)'}`,
+        boxShadow: highlighted ? '0 0 0 3px rgba(124,110,248,.25)' : 'none',
+        borderRadius: 12, padding: 14,
+        transition: 'border-color .2s, box-shadow .2s',
       }}
     >
-      {/* Overlapping face crops */}
-      <div style={{ display: 'flex', flexShrink: 0 }}>
-        {cluster.representative_crops.slice(0, 3).map((crop, i) => (
-          <img
-            key={i}
-            src={`data:image/jpeg;base64,${crop}`}
+      {hero && (
+        <img
+          src={`data:image/jpeg;base64,${hero.crop}`}
+          onClick={() => onOpen(0)}
+          title="See this face in its photo"
+          alt=""
+          style={{ width: 128, height: 128, borderRadius: 12, objectFit: 'cover', flexShrink: 0, cursor: 'zoom-in', background: 'var(--surface-2)' }}
+        />
+      )}
+
+      <div style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', justifyContent: 'space-between', gap: 12 }}>
+        <div style={{ display: 'flex', alignItems: 'flex-start', gap: 12 }}>
+          <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+            {samples.map((rep, i) => (
+              <img
+                key={rep.face_id}
+                src={`data:image/jpeg;base64,${rep.crop}`}
+                onClick={() => onOpen(i + 1)}
+                title="See this face in its photo"
+                alt=""
+                style={{ width: 56, height: 56, borderRadius: 8, objectFit: 'cover', cursor: 'zoom-in', background: 'var(--surface-2)' }}
+              />
+            ))}
+          </div>
+          <div style={{ marginLeft: 'auto', textAlign: 'right', flexShrink: 0 }}>
+            <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--text-primary)' }}>{countLabel(cluster)}</div>
+            <div style={{ fontSize: 12, color: '#71717A' }}>appearances on this trip</div>
+          </div>
+        </div>
+
+        <div style={{ display: 'flex', gap: 10 }}>
+          <input
+            type="text"
+            value={value}
+            onChange={e => onChange(e.target.value)}
+            onKeyDown={e => { if (e.key === 'Enter') onSave() }}
+            placeholder="Name this person…"
             style={{
-              width: 44, height: 44, borderRadius: 10, objectFit: 'cover',
-              border: '2px solid var(--surface)',
-              marginLeft: i > 0 ? -12 : 0,
+              flex: 1, minWidth: 0, height: 38, border: '1px solid var(--border)', borderRadius: 8,
+              background: 'var(--bg)', color: '#52525b', padding: '0 12px', fontSize: 13, outline: 'none',
             }}
-            alt=""
+            onFocus={e => { e.currentTarget.style.borderColor = 'var(--accent)'; e.currentTarget.style.color = 'var(--text-primary)' }}
+            onBlur={e => { e.currentTarget.style.borderColor = 'var(--border)'; e.currentTarget.style.color = '#52525b' }}
           />
-        ))}
+          <button
+            onClick={onSave}
+            disabled={!value.trim() || saving}
+            style={{
+              background: 'var(--accent)', color: '#fff', border: 'none',
+              borderRadius: 8, padding: '9px 16px', fontSize: 13, fontWeight: 600,
+              cursor: !value.trim() || saving ? 'not-allowed' : 'pointer',
+              opacity: !value.trim() || saving ? 0.4 : 1,
+              flexShrink: 0,
+            }}
+          >
+            {saving ? <Loader2 size={14} className="animate-spin" /> : 'Save'}
+          </button>
+        </div>
       </div>
-
-      <span style={{ fontSize: 12, fontWeight: 500, color: '#71717A', width: 90, flexShrink: 0 }}>
-        {cluster.size} appearances
-      </span>
-
-      {/* Name input */}
-      <input
-        type="text"
-        value={value}
-        onChange={e => onChange(e.target.value)}
-        onKeyDown={e => { if (e.key === 'Enter') onSave() }}
-        placeholder="Name this person…"
-        style={{
-          flex: 1, height: 38, border: '1px solid var(--border)', borderRadius: 8,
-          background: 'var(--bg)', color: '#52525b', padding: '0 12px', fontSize: 13, outline: 'none',
-        }}
-        onFocus={e => { e.currentTarget.style.borderColor = 'var(--accent)'; e.currentTarget.style.color = 'var(--text-primary)' }}
-        onBlur={e => { e.currentTarget.style.borderColor = 'var(--border)'; e.currentTarget.style.color = '#52525b' }}
-      />
-
-      <button
-        onClick={onSave}
-        disabled={!value.trim() || saving}
-        style={{
-          background: 'var(--accent)', color: '#fff', border: 'none',
-          borderRadius: 8, padding: '9px 16px', fontSize: 13, fontWeight: 600,
-          cursor: !value.trim() || saving ? 'not-allowed' : 'pointer',
-          opacity: !value.trim() || saving ? 0.4 : 1,
-          flexShrink: 0,
-        }}
-      >
-        {saving ? <Loader2 size={14} className="animate-spin" /> : 'Save'}
-      </button>
     </div>
   )
 }
 
 // ── Singleton card ─────────────────────────────────────────────────────────────
 
-function SingletonCard({ cluster, suggestionName, hasSuggestion, onConfirmSuggestion, onDismiss, onName }: {
+function SingletonCard({ cluster, suggestionName, hasSuggestion, onConfirmSuggestion, onDismiss, onName, onOpen, highlighted, cardRef }: {
   cluster: FaceCluster
   suggestionName: string | null
   hasSuggestion: boolean
   onConfirmSuggestion: () => void
   onDismiss: () => void
   onName: (val: string) => void
+  onOpen: () => void
+  highlighted: boolean
+  cardRef: (el: HTMLDivElement | null) => void
 }) {
   const [showInput, setShowInput] = useState(false)
   const [val, setVal] = useState('')
+  const hero = cluster.representatives[0]
 
   return (
     <div
+      ref={cardRef}
       style={{
         background: 'var(--surface)',
-        border: hasSuggestion ? '1px solid rgba(124,110,248,.45)' : '1px solid var(--border)',
+        border: highlighted ? '1px solid var(--accent)' : hasSuggestion ? '1px solid rgba(124,110,248,.45)' : '1px solid var(--border)',
+        boxShadow: highlighted ? '0 0 0 3px rgba(124,110,248,.25)' : 'none',
         borderRadius: 12, padding: 12, textAlign: 'center',
+        transition: 'border-color .2s, box-shadow .2s',
       }}
     >
-      {cluster.representative_crops[0] && (
+      {hero && (
         <img
-          src={`data:image/jpeg;base64,${cluster.representative_crops[0]}`}
-          style={{ width: '100%', aspectRatio: '1', objectFit: 'cover', borderRadius: 10, marginBottom: 8, display: 'block' }}
+          src={`data:image/jpeg;base64,${hero.crop}`}
+          onClick={onOpen}
+          title="See this face in its photo"
           alt=""
+          style={{ width: '100%', aspectRatio: '1', objectFit: 'cover', borderRadius: 10, marginBottom: 8, display: 'block', cursor: 'zoom-in', background: 'var(--surface-2)' }}
         />
       )}
       <div style={{ fontSize: 11, fontWeight: 500, color: '#71717A', marginBottom: 8 }}>
@@ -559,4 +816,131 @@ function SingletonCard({ cluster, suggestionName, hasSuggestion, onConfirmSugges
       )}
     </div>
   )
+}
+
+// ── Face in context lightbox ───────────────────────────────────────────────────
+//
+// Shows one of the cluster's sample faces cropped from the original photo with
+// its surroundings (the backend outlines the face), plus a strip to flip through
+// the other samples and a name field so the person can be enrolled from here.
+
+function FaceLightbox({ cluster, index, savedName, saving, onIndex, onClose, onName }: {
+  cluster: FaceCluster
+  index: number
+  savedName: string | null
+  saving: boolean
+  onIndex: (i: number) => void
+  onClose: () => void
+  onName: (val: string) => void
+}) {
+  const reps = cluster.representatives
+  const rep = reps[index]
+  const [loadedId, setLoadedId] = useState<string | null>(null)   // face whose context image has arrived
+  const [val, setVal] = useState('')
+
+  if (!rep) return null
+  const loaded = loadedId === rep.face_id
+  const canSave = !!val.trim() && !saving
+
+  return (
+    <div
+      style={{ position: 'fixed', inset: 0, zIndex: 60, background: 'rgba(8,8,11,.88)', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 16 }}
+      onClick={e => { if (e.target === e.currentTarget) onClose() }}
+    >
+      <div style={{ width: 'min(860px, 96vw)', maxHeight: '94vh', display: 'flex', flexDirection: 'column', background: 'var(--surface)', border: '1px solid var(--border)', borderRadius: 14, overflow: 'hidden' }}>
+
+        <div style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '12px 14px', borderBottom: '1px solid var(--border)' }}>
+          <button onClick={onClose} style={overlayCloseBtn}><X size={16} /></button>
+          <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--text-primary)' }}>
+            {savedName ?? 'Unnamed cluster'} · {countLabel(cluster)}
+          </span>
+          <span style={{ marginLeft: 'auto', minWidth: 0, fontSize: 12, fontFamily: 'ui-monospace, monospace', color: '#71717A', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+            {rep.file_name}
+          </span>
+          <span style={{ fontSize: 12, color: '#71717A', flexShrink: 0, fontVariantNumeric: 'tabular-nums' }}>
+            {index + 1} / {reps.length}
+          </span>
+        </div>
+
+        <div style={{ position: 'relative', height: 'min(62vh, 560px)', background: '#000', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+          {!loaded && (
+            <Loader2 className="animate-spin" size={22} style={{ position: 'absolute', color: 'var(--accent)' }} />
+          )}
+          <img
+            key={rep.face_id}
+            src={api.photos.faceContextUrl(rep.photo_id, rep.face_id, 800)}
+            onLoad={() => setLoadedId(rep.face_id)}
+            alt=""
+            style={{ maxWidth: '100%', maxHeight: '100%', objectFit: 'contain', display: 'block', opacity: loaded ? 1 : 0, transition: 'opacity .15s' }}
+          />
+          {reps.length > 1 && (
+            <>
+              <button onClick={() => onIndex(Math.max(0, index - 1))} disabled={index === 0} style={{ ...lightboxArrow, left: 10, opacity: index === 0 ? 0.25 : 1 }}>
+                <ChevronLeft size={18} />
+              </button>
+              <button onClick={() => onIndex(Math.min(reps.length - 1, index + 1))} disabled={index === reps.length - 1} style={{ ...lightboxArrow, right: 10, opacity: index === reps.length - 1 ? 0.25 : 1 }}>
+                <ChevronRight size={18} />
+              </button>
+            </>
+          )}
+        </div>
+
+        <div style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '12px 14px', borderTop: '1px solid var(--border)', flexWrap: 'wrap' }}>
+          <div style={{ display: 'flex', gap: 6 }}>
+            {reps.map((r, i) => (
+              <img
+                key={r.face_id}
+                src={`data:image/jpeg;base64,${r.crop}`}
+                onClick={() => onIndex(i)}
+                alt=""
+                style={{
+                  width: 48, height: 48, borderRadius: 8, objectFit: 'cover', cursor: 'pointer',
+                  outline: i === index ? '2px solid var(--accent)' : '2px solid transparent', outlineOffset: 1,
+                  opacity: i === index ? 1 : 0.7,
+                }}
+              />
+            ))}
+          </div>
+
+          {savedName ? (
+            <span style={{ marginLeft: 'auto', fontSize: 13, fontWeight: 600, color: '#86efac' }}>Enrolled as {savedName}</span>
+          ) : (
+            <div style={{ marginLeft: 'auto', display: 'flex', gap: 8, flex: '1 1 260px', justifyContent: 'flex-end' }}>
+              <input
+                type="text"
+                value={val}
+                onChange={e => setVal(e.target.value)}
+                onKeyDown={e => { if (e.key === 'Enter' && canSave) onName(val.trim()) }}
+                autoFocus
+                placeholder="Name this person…"
+                style={{
+                  flex: '1 1 160px', maxWidth: 320, height: 36, border: '1px solid var(--border)', borderRadius: 8,
+                  background: 'var(--bg)', color: 'var(--text-primary)', padding: '0 12px', fontSize: 13, outline: 'none',
+                }}
+                onFocus={e => { e.currentTarget.style.borderColor = 'var(--accent)' }}
+                onBlur={e => { e.currentTarget.style.borderColor = 'var(--border)' }}
+              />
+              <button
+                onClick={() => canSave && onName(val.trim())}
+                disabled={!canSave}
+                style={{
+                  background: 'var(--accent)', color: '#fff', border: 'none', borderRadius: 8, padding: '0 16px',
+                  fontSize: 13, fontWeight: 600, cursor: canSave ? 'pointer' : 'not-allowed', opacity: canSave ? 1 : 0.4, flexShrink: 0,
+                }}
+              >
+                {saving ? <Loader2 size={14} className="animate-spin" /> : 'Save'}
+              </button>
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  )
+}
+
+const lightboxArrow: React.CSSProperties = {
+  position: 'absolute', top: '50%', transform: 'translateY(-50%)',
+  width: 36, height: 36, borderRadius: '50%', border: 'none',
+  background: 'rgba(22,22,31,.85)', color: 'var(--text-primary)',
+  display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer',
 }

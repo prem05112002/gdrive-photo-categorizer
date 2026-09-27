@@ -23,6 +23,7 @@ CLUSTER_DISTANCE_THRESHOLD = 0.45
 ATTACH_SIM = 0.50
 SUGGEST_SIM = 0.38
 REP_TOP_K = 5
+REP_COUNT = 6   # sample faces returned per cluster for the enroll UI
 
 
 def cluster_faces(session: Session, trip_id: str) -> list[dict]:
@@ -94,18 +95,47 @@ def cluster_faces(session: Session, trip_id: str) -> list[dict]:
     result = []
     for label, idxs in clusters:
         faces = [rows[i] for i in idxs]
-        top = sorted(faces, key=lambda f: f.confidence or 0.0, reverse=True)[:4]
+        reps = _pick_representatives(faces, REP_COUNT)
         suggested = suggestions.get(idxs[0]) if len(idxs) == 1 else None
         result.append({
             "cluster_id": int(label),  # numpy.int64 → Python int for JSON serialization
             "size": len(faces),
+            "photo_count": len({f.photo_id for f in faces}),
             "is_singleton": len(faces) < 3,
             "face_ids": [f.id for f in faces],
-            "representative_crops": [f.face_crop for f in top if f.face_crop],
+            "representatives": reps,  # FaceObservation rows, best first
+            "representative_crops": [f.face_crop for f in reps],
             "suggested_cluster_id": int(suggested) if suggested is not None else None,
         })
 
     return result
+
+
+def _pick_representatives(faces: list[FaceObservation], k: int) -> list[FaceObservation]:
+    """
+    Best-first sample of a cluster for display: highest detector confidence,
+    then sharpest, spread across different photos so one burst doesn't fill
+    every slot. Faces without a stored crop are skipped.
+    """
+    ranked = sorted(
+        (f for f in faces if f.face_crop),
+        key=lambda f: (f.confidence or 0.0, f.blur_score or 0.0),
+        reverse=True,
+    )
+    picked: list[FaceObservation] = []
+    seen_photos: set[str] = set()
+    for f in ranked:
+        if f.photo_id not in seen_photos:
+            picked.append(f)
+            seen_photos.add(f.photo_id)
+        if len(picked) == k:
+            return picked
+    for f in ranked:
+        if len(picked) == k:
+            break
+        if f not in picked:
+            picked.append(f)
+    return picked
 
 
 def count_low_quality(session: Session, trip_id: str) -> int:

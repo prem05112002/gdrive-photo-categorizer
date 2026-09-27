@@ -47,6 +47,19 @@ Full-pipeline speed + accuracy overhaul. Five commits on `v2`:
 - **RGB→BGR fix.** `_load_image` yields RGB (PIL), but InsightFace's model zoo is written for cv2 input and swaps channels itself (`swapRB=True` in both `retinaface.py` and `arcface_onnx.py`), so the detector and ArcFace were seeing swapped channels. Now `cv2.cvtColor(img, COLOR_RGB2BGR)` is applied for the model only; face crops and blur scores stay RGB. Measured on the Kochi trip (1139 photos): the six dominant people clustered as `209/144/125/111/92/92` faces plus `32/23`-face fragments before, `220/147/129/125/122/117` after with the next cluster at 11 — same intra-cluster cosine (≈0.68) at larger sizes, 27 → 16 suggested singletons. Faces detected 1291 → 1327 (the detector input changed too).
 - **`allowed_modules=["detection", "recognition"]`** — the 3d68/2d106 landmark and gender/age sub-models were loaded and run on every face for nothing (~30% CPU time, ~150 MB of weights). Nothing reads their outputs.
 - `crud.update_trip_status` now clears `error_message` on any non-failed transition, so a trip that recovered from a crash no longer carries the stale failure text.
+- **EXIF orientation applied before detection** (`_load_image`, and `utils/image.open_for_processing` + `scene.py` for consistency). 155 of the 1139 Kochi photos are phone JPEGs stored sideways with an orientation tag; the detector was seeing them rotated. On those photos alone: 109 faces (85 passing the quality gate) before vs 171 (167 passing) after. Whole trip: 1327 → 1389 faces, low-quality 282 → 263, group photos 70 → 81, main clusters `240/160/148/139/135/128`. Detection space is now the *upright* image (long side ≤1920), which is also what browsers show and what `api/body.py` and the gallery overlay already assumed — stored bboxes for rotated photos were previously in the wrong space.
+
+---
+
+## 2b. Enroll page redesign (2026-09-27)
+
+**Problem:** naming a cluster from three 44px crops was guesswork, and the "Group photos" panel showed disembodied face crops with nothing to do.
+
+**Changes:**
+- **Reference photos** (left, 400px): the actual group photo (`/thumbnail?w=800`) with every detected face boxed. Boxes are positioned as percentages of the detection-space size (`det_width`/`det_height` from the API), so no image measuring. Click a face → the roster scrolls to and flashes its cluster; named faces get a green label, so the photo fills in as you enroll. Expand button opens the same view large.
+- **Cluster cards:** one 128px hero crop + up to five 56px samples chosen best-first and **spread across different photos** (`_pick_representatives`), plus "N faces in M photos". Any crop opens the **face-in-context lightbox**.
+- **Face-in-context lightbox:** `GET /api/photos/{photo}/face/{face}/context?w=` crops ~3 face-widths around the box from the original (EXIF-upright), outlines the face, and the modal lets you flip through the samples and name the person right there.
+- Endpoints: `GET /enrollment/{trip}/group-photos` now returns `det_width/det_height` and `faces[]` (bbox, person_id/name, quality flags) instead of six crops; `GET /enrollment/{trip}/clusters` returns `representatives[]` (face_id, photo_id, file_name, bbox, crop) and `photo_count`. `representative_crops` is still produced for the Review page's Misc clusters.
 
 ---
 

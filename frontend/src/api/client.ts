@@ -54,19 +54,45 @@ export interface FaceStats {
   group_photo_candidates: number
 }
 
+export interface GroupPhotoFace {
+  face_id: string
+  bbox_x: number
+  bbox_y: number
+  bbox_w: number
+  bbox_h: number
+  person_id: string | null
+  person_name: string | null   // set when the face was already enrolled (this or an earlier session)
+  is_low_quality: boolean      // hidden from clustering — drawn dimmed, not clickable
+  is_stranger: boolean
+}
+
 export interface GroupPhoto {
   id: string
-  file_name: string
+  file_name: string | null
   face_count: number
-  face_crops: string[]  // base64 JPEG
+  det_width: number            // size of the image as the face pipeline saw it (EXIF-upright, ≤1920 long side)
+  det_height: number           // bboxes live in this space → position them as percentages
+  faces: GroupPhotoFace[]
+}
+
+export interface FaceRep {
+  face_id: string
+  photo_id: string
+  file_name: string | null
+  bbox_x: number | null
+  bbox_y: number | null
+  bbox_w: number | null
+  bbox_h: number | null
+  crop: string                 // base64 JPEG, ≤256px, tight around the face
 }
 
 export interface FaceCluster {
   cluster_id: number
   size: number
+  photo_count: number
   is_singleton: boolean
   face_ids: string[]
-  representative_crops: string[]  // base64 JPEG
+  representatives: FaceRep[]   // best first, spread across different photos
   suggested_cluster_id: number | null
 }
 
@@ -329,6 +355,7 @@ export const api = {
     imageUrl: (photoId: string, tripId: string) => `${BASE}/photos/${photoId}/image?trip_id=${tripId}`,
     thumbnailUrl: (photoId: string, tripId: string, w = 480) => `${BASE}/photos/${photoId}/thumbnail?trip_id=${tripId}&w=${w}`,
     faceUrl: (photoId: string, faceId: string) => `${BASE}/photos/${photoId}/face/${faceId}`,
+    faceContextUrl: (photoId: string, faceId: string, w = 720) => `${BASE}/photos/${photoId}/face/${faceId}/context?w=${w}`,
     updateSceneLabel: (photoId: string, tripId: string, sceneLabel: string) =>
       request<{ scene_label: string }>(
         `/photos/${photoId}/scene-label`,

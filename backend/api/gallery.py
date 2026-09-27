@@ -292,3 +292,59 @@ def get_face_crop(
         raise HTTPException(404, "No face crop available")
 
     return Response(content=face.face_crop, media_type="image/jpeg")
+
+
+@photos_router.get("/{photo_id}/face/{face_id}/context")
+def get_face_context(
+    photo_id: str,
+    face_id: str,
+    w: int = Query(default=720, ge=128, le=1600),
+    session: Session = Depends(get_session),
+):
+    """
+    A face in context: a crop of the original photo about three face-widths
+    wide around the box, with the face outlined. The stored 256px crops are too
+    tight to recognise someone from; hair, shoulders and setting make it obvious.
+    """
+    import pillow_heif
+    from PIL import Image, ImageDraw, ImageOps
+    from pipeline.face import MAX_LONG_SIDE
+    pillow_heif.register_heif_opener()
+
+    face = session.query(FaceObservation).filter(
+        FaceObservation.id == face_id,
+        FaceObservation.photo_id == photo_id,
+    ).first()
+    if not face or face.bbox_w is None or face.bbox_h is None:
+        raise HTTPException(404, "Face not found")
+    photo = session.query(Photo).filter(Photo.id == photo_id).first()
+    if not photo or not photo.local_path:
+        raise HTTPException(404, "Photo not found")
+    path = Path(photo.local_path)
+    if not path.exists():
+        raise HTTPException(404, detail={"cache_cleared": True, "message": "Photo not on disk"})
+
+    with Image.open(path) as img:
+        img = ImageOps.exif_transpose(img)
+        # detection space (EXIF-upright, long side ≤ MAX_LONG_SIDE) → original pixels
+        scale = min(MAX_LONG_SIDE / max(img.width, img.height), 1.0)
+        bx, by, bw, bh = (v / scale for v in (face.bbox_x, face.bbox_y, face.bbox_w, face.bbox_h))
+        cw, ch = bw * 3.0, bh * 3.4
+        cx, cy = bx + bw / 2, by + bh * 0.85   # centre a little below the face → shoulders in frame
+        x1, y1 = max(0, int(cx - cw / 2)), max(0, int(cy - ch / 2))
+        x2, y2 = min(img.width, int(cx + cw / 2)), min(img.height, int(cy + ch / 2))
+        crop = img.crop((x1, y1, x2, y2)).convert("RGB")
+
+        out_scale = min(w / max(crop.width, crop.height), 1.0)
+        if out_scale < 1.0:
+            crop = crop.resize((int(crop.width * out_scale), int(crop.height * out_scale)), Image.LANCZOS)
+        fx1, fy1 = (bx - x1) * out_scale, (by - y1) * out_scale
+        ImageDraw.Draw(crop).rounded_rectangle(
+            (fx1, fy1, fx1 + bw * out_scale, fy1 + bh * out_scale),
+            radius=6, outline=(124, 110, 248), width=3,
+        )
+        buf = io.BytesIO()
+        crop.save(buf, format="JPEG", quality=85)
+
+    return Response(content=buf.getvalue(), media_type="image/jpeg",
+                    headers={"Cache-Control": "public, max-age=86400"})
