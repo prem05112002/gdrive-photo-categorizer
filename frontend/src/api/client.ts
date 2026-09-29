@@ -3,7 +3,8 @@ export interface Trip {
   name: string
   drive_folder_id: string
   status: string
-  expected_member_count: number | null
+  expected_member_count: number | null   // guess given at creation; replaced by the real count when enrollment is done
+  member_count: number                   // people actually enrolled
   output_folder_id: string | null
   last_good_status: string | null
   error_message: string | null
@@ -256,6 +257,8 @@ export const api = {
     create: (payload: CreateTripPayload) =>
       request<Trip>('/trips/', { method: 'POST', body: JSON.stringify(payload) }),
     get: (id: string) => request<Trip>(`/trips/${id}`),
+    update: (id: string, payload: { expected_member_count: number }) =>
+      request<Trip>(`/trips/${id}`, { method: 'PATCH', body: JSON.stringify(payload) }),
     delete: (id: string) => request<void>(`/trips/${id}`, { method: 'DELETE' }),
   },
   processing: {

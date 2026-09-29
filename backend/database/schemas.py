@@ -9,12 +9,17 @@ class TripCreate(BaseModel):
     expected_member_count: Optional[int] = None
 
 
+class TripUpdate(BaseModel):
+    expected_member_count: Optional[int] = None
+
+
 class TripResponse(BaseModel):
     id: str
     name: str
     drive_folder_id: str
     status: str
-    expected_member_count: Optional[int]
+    expected_member_count: Optional[int]   # the guess given at creation; Enroll's Done replaces it with the real count
+    member_count: int = 0                  # people actually enrolled for this trip
     output_folder_id: Optional[str] = None
     last_good_status: Optional[str] = None
     error_message: Optional[str] = None

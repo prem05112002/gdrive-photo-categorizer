@@ -2,10 +2,11 @@ import shutil
 import uuid
 from pathlib import Path
 from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from database.models import Trip, TripPerson, UserCorrection, PersonOutfit, UnmatchedPerson, PotentialMisclassification, get_session
-from database.schemas import TripCreate, TripResponse
+from database.schemas import TripCreate, TripResponse, TripUpdate
 from database import crud
 from drive.ingest import extract_folder_id, TEMP_DIR
 
@@ -14,6 +15,11 @@ router = APIRouter()
 
 def _enrich(trip: Trip, session: Session) -> TripResponse:
     counts = crud.get_trip_photo_counts(session, trip.id)
+    member_count = (
+        session.query(func.count(TripPerson.person_id))
+        .filter(TripPerson.trip_id == trip.id)
+        .scalar()
+    ) or 0
     return TripResponse(
         id=trip.id,
         name=trip.name,
@@ -24,6 +30,7 @@ def _enrich(trip: Trip, session: Session) -> TripResponse:
         last_good_status=trip.last_good_status,
         error_message=trip.error_message,
         created_at=trip.created_at,
+        member_count=member_count,
         **counts,
     )
 
@@ -55,6 +62,21 @@ def get_trip(trip_id: str, session: Session = Depends(get_session)):
     trip = crud.get_trip(session, trip_id)
     if not trip:
         raise HTTPException(status_code=404, detail="Trip not found")
+    return _enrich(trip, session)
+
+
+@router.patch("/{trip_id}", response_model=TripResponse)
+def update_trip(trip_id: str, data: TripUpdate, session: Session = Depends(get_session)):
+    """Edit trip metadata. Enroll's Done uses it to replace the member-count guess with the enrolled count."""
+    trip = crud.get_trip(session, trip_id)
+    if not trip:
+        raise HTTPException(status_code=404, detail="Trip not found")
+    if data.expected_member_count is not None:
+        if data.expected_member_count < 0:
+            raise HTTPException(status_code=422, detail="expected_member_count must be 0 or more")
+        trip.expected_member_count = data.expected_member_count
+    session.commit()
+    session.refresh(trip)
     return _enrich(trip, session)
 
 

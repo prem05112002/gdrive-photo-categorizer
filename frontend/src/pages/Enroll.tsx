@@ -201,6 +201,18 @@ export function Enroll() {
     setHighlight({ id: cid, at: Date.now() })
   }
 
+  async function finish() {
+    if (!id) return
+    // Enrollment is the source of truth for how many people were on the trip —
+    // replace the guess typed at trip creation so cards and coverage show the real number
+    if (named > 0 && named !== expected) {
+      try {
+        await api.trips.update(id, { expected_member_count: named })
+      } catch { /* cosmetic — never block leaving the page */ }
+    }
+    navigate(`/trips/${id}`)
+  }
+
   if (loading) {
     return (
       <div style={{ minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', background: 'var(--bg)' }}>
@@ -242,7 +254,7 @@ export function Enroll() {
         actions={
           named > 0 ? (
             <button
-              onClick={() => navigate(`/trips/${id}`)}
+              onClick={finish}
               style={{ background: '#22C55E', color: '#06140b', border: 'none', borderRadius: 7, padding: '9px 16px', fontSize: 13, fontWeight: 700, cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 6 }}
             >
               Done ✓

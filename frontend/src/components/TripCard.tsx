@@ -89,7 +89,9 @@ export function TripCard({ trip }: Props) {
         <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
           <span style={{ fontSize: 12, fontWeight: 500, color: '#a1a1aa' }}>
             {trip.photo_count > 0 ? `${trip.photo_count} photos` : 'No photos yet'}
-            {trip.expected_member_count ? ` · ${trip.expected_member_count} people` : ''}
+            {trip.member_count > 0
+              ? ` · ${trip.member_count} people`
+              : trip.expected_member_count ? ` · ${trip.expected_member_count} people expected` : ''}
           </span>
           <StatusPill status={trip.status} />
         </div>
