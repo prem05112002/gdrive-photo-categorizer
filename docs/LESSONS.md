@@ -66,6 +66,34 @@ Every problem this project has hit since Phase 0 (2026-06) and how it was solved
 - Fix: decided on a bot Google account the user shares the folder with; Google Sign-In only for identity.
 - Prevent: re-read `session10` notes before any tenancy or scope change; do not design around per-user Drive consent.
 
+**Videos never got a shortcut (audit 2026-09-29, fixed same day)**
+- Symptom: README promised `Videos/`; the planner skipped every `is_video` row (Kochi: 12 `.MOV`), so the "0 unrouted" dry-run was true only by construction.
+- Root cause: the skip branch was written as "not a photo".
+- Fix: `("Videos",)` folder in `plan_trip_output`; plan 1705 → 1717 shortcuts.
+- Prevent: every file class the README lists has a branch in the planner, and the dry-run's per-folder counts must add up to the processable total.
+
+**No retries on Drive writes; per-item failures swallowed (audit 2026-09-29, fixed same day)**
+- Symptom: a 403 rate-limit burst during 10-way shortcut creation would drop photos from the tree while the trip still said "uploaded".
+- Root cause: `execute()` defaults to `num_retries=0`; the worker loop only printed the exception.
+- Fix: `num_retries=DRIVE_RETRIES` on every Drive call; `failed` counted into the upload progress and shown next to the result.
+- Prevent: every Drive call passes the retry constant; a bulk step reports its failure count in its done payload, never only successes.
+
+**Re-upload never removed shortcuts that no longer belong (audit 2026-09-29, fixed same day)**
+- Symptom: a photo moved out of Misc by Review, or reassigned in the gallery, stayed in its old Drive folder forever; Sync only handled gallery corrections.
+- Root cause: the builder only created; dedupe was per (name, parent, target).
+- Fix: `prune_stale_shortcuts` walks every folder under `[Organized]` and deletes shortcuts whose target isn't planned there (shortcuts only, never folders or files); unit-checked against a fake tree.
+- Prevent: a step that syncs to an external system reconciles both ways — create what is missing, remove what is extra — and is tested with a stub before it touches the real account.
+
+**Drive query literals were not escaped (audit 2026-09-29, fixed same day)**
+- Symptom: a person or file named `O'Brien` would 400 the folder lookup and abort the upload.
+- Fix: `_q()` escapes `\` and `'` in every `q=` string.
+- Prevent: never interpolate a user-controlled name into a query string without the escape helper.
+
+**Gallery load waited on a Drive check (audit 2026-09-29, fixed same day)**
+- Symptom: after an upload, `sync-status` verified every person folder on Drive (two calls per person) on every gallery load — and behind a dead token that call blocks on OAuth consent, so the page would have hung.
+- Fix: verification is opt-in (`?verify=1`); the gallery renders from trip + gallery data and fetches the pending badge afterwards with its own catch.
+- Prevent: nothing on a page's render path calls an external service; secondary data loads after first paint and can fail alone.
+
 ---
 
 ## 2. SQLAlchemy / SQLite
@@ -123,6 +151,18 @@ Every problem this project has hit since Phase 0 (2026-06) and how it was solved
 - Root cause: `pipeline/classify.py`, `pipeline/body.py`, `drive/output.py` and `enrollment/router.py` wrote `Trip.status` directly, skipping the helper that maintains `last_good_status` and clears `error_message`.
 - Fix: every transition goes through `crud.update_trip_status`; a face re-run on an enrolled trip lands back at `enrolled` (roster kept) instead of `faces_extracted`.
 - Prevent: grep for `"status":` / `trip.status =` outside `database/crud.py` in review; the helper is the only writer.
+
+**Re-ingest after Clear Cache marked every photo an exact duplicate of itself (audit 2026-09-29, fixed same day)**
+- Symptom: `DELETE /trips/{id}/cache` then Ingest would insert 1139 junk `is_duplicate` rows pointing at their own originals, download nothing, and leave every original with a dead `local_path`.
+- Root cause: the md5 dedupe map was seeded from all existing rows, including the ones whose file was gone and therefore pending re-download.
+- Fix: rows with a missing file are excluded from the seed maps and re-downloaded into the same row (faces and enrollment keep their photo id); exercised against a stubbed Drive and a temp DB.
+- Prevent: when a resume guard puts a row back into the work queue, the row must not also be a dedupe reference; test the "second run" of every idempotent step, not only the first.
+
+**Removing a person left this trip's registry embeddings behind (audit 2026-09-29, fixed same day)**
+- Symptom: the next classify re-matched the freed faces against their own embeddings (cosine 1.0) and re-linked the person; the removal undid itself.
+- Root cause: `delete_enrolled_person` only deleted embeddings when the person was in no other trip.
+- Fix: embeddings whose `source_photo_id` is in this trip are deleted on removal; a gallery reassign moves the matching embedding to the new person.
+- Prevent: every undo path deletes or moves the derived rows it created, not just the flag on the primary row.
 
 ---
 
@@ -280,6 +320,18 @@ Every problem this project has hit since Phase 0 (2026-06) and how it was solved
 - Fix: lazy double-checked singletons (`get_model`, `get_encoder`), decode prefetch pools that receive plain values.
 - Prevent: new models follow the same singleton shape; inference stays on the pipeline thread.
 
+**The same step could run twice on a trip (audit 2026-09-29, fixed same day, `pipeline/jobs.py`)**
+- Symptom: reload mid-upload → "Upload to Drive" shown again → a second thread racing the first into duplicate person folders and shortcuts.
+- Root cause: status-only guards; classify and upload write no in-progress status; no registry of running threads.
+- Fix: every step starts through `jobs.start(step, trip_id, target, reset)`, which refuses (409) while that step's thread is alive; TripDetail re-attaches to running streams on mount.
+- Prevent: no bare `threading.Thread(...).start()` for a pipeline step; the jobs table (stage 2) replaces this registry.
+
+**A new subscriber read the previous run's "done" (audit 2026-09-29, fixed same day)**
+- Symptom: retrying a failed step could close the progress stream on the old terminal event before the new thread wrote its first update, leaving a spinner with no stream (or the retry button back mid-run).
+- Root cause: module-level progress dicts were never reset between runs.
+- Fix: `jobs.start` resets the step's progress to `waiting` before the thread starts.
+- Prevent: a run's first act is to claim its progress slot; clients treat `waiting` as "not started", never as "finished".
+
 ---
 
 ## 5. Photo routing & review logic
@@ -336,6 +388,21 @@ Every problem this project has hit since Phase 0 (2026-06) and how it was solved
 **Missing EXIF date makes outfit date "today" (found 2026-09-26, OPEN, parked)**
 - Root cause: `pipeline/body.py` falls back to `datetime.now()`; `trips.timezone` is a dead column.
 - Prevent: outfit day-grouping is parked with body detection.
+
+**Our own `[Organized]` tree was re-ingested as source material (audit 2026-09-29, fixed same day)**
+- Symptom: after an upload the source folder holds ~1700 shortcuts named like the photos; a re-ingest listed them (no md5/size → past every skip) and tried to download shortcuts, and the run's end reset the trip to `ingested`.
+- Fix: `_list_files` skips `[Organized]` by name and by `output_folder_id`, and every shortcut; a re-ingest that adds nothing keeps the trip's status, new photos put it back at `ingested`.
+- Prevent: whatever the app writes into the user's space is excluded from what it reads back, by identity, before the first re-ingest is attempted.
+
+**Assign paths did not link the person to the trip (audit 2026-09-29, fixed same day)**
+- Symptom: a gallery reassign or Review assign to a person not yet in `TripPerson` left them invisible in the gallery and unrouted in the plan.
+- Fix: `crud.add_person_to_trip` on every path that sets `person_id`; bulk assign/dismiss act only on this trip's unassigned faces.
+- Prevent: setting `person_id` and linking the person to the trip are one operation.
+
+**Re-run guards written for the happy path, again (audit 2026-09-29, fixed same day)**
+- Symptom: after an upload, the Re-run and Re-upload buttons the UI shows returned 409, and a re-run would have rolled the status back.
+- Fix: classify accepts `uploaded`/`body_detected`, upload accepts `body_detected`, and both keep the current status when it is already past theirs.
+- Prevent: a re-run never moves the status backwards; guards list the states where the action is unsafe.
 
 ---
 
@@ -413,6 +480,31 @@ Every problem this project has hit since Phase 0 (2026-06) and how it was solved
 - Fix: wait on `textContent`; allow 60 s for Vite's first compile.
 - Prevent: use `textContent` in CDP predicates; never click a writing action against the real DB.
 
+**A held Enter key created a person twice (audit 2026-09-29, fixed same day)**
+- Symptom: `saveName` had no in-flight guard and `onKeyDown` fires on auto-repeat → two "Alice" rows, duplicated embeddings, "Identified 7 / 6".
+- Fix: return early while the cluster is in `saving`; key handlers ignore `e.repeat`.
+- Prevent: every mutating handler checks its in-flight set first; keyboard submit handlers ignore repeats.
+
+**Session state keyed by per-run cluster ids (audit 2026-09-29, fixed same day)**
+- Symptom: Remove refetched clusters, the agglomerative labels were renumbered, and `savedNames`/`dismissed` keyed by the old ids mislabelled faces or hid clusters as "already named".
+- Fix: reset keyed state after the refetch (the server already excludes named and dismissed faces).
+- Prevent: never key UI state by a value the backend regenerates per request; use a stable id or reset on refetch.
+
+**Action failures replaced the page; no re-attach after a reload (audit 2026-09-29, fixed same day)**
+- Symptom: a 409 from a step button rendered the full-screen "trip not found" view; reloading mid-run showed a spinner with no stream, or the start button again.
+- Fix: separate `actionError` banner; on mount subscribe to the stream matching an in-progress status and probe the classify/upload streams (first event `running` → attached, else closed); closers stored and called on unmount.
+- Prevent: load errors and action errors are different states; every SSE subscription's closer is kept and called on unmount.
+
+**Queue index went negative after the last item (audit 2026-09-29, fixed same day)**
+- Symptom: Verify These rendered nothing after clearing the queue and re-running (`list[-1]`).
+- Fix: clamp with `Math.max(0, …)` and reset to 0 on refetch.
+- Prevent: any index into a list that shrinks is clamped at both ends.
+
+**Home card showed a resting `classified` trip as processing (audit 2026-09-29, fixed same day)**
+- Symptom: the flagship trip's card was dimmed with an indeterminate bar and a pulsing pill.
+- Root cause: a status set copied from a sketch included `classified`.
+- Prevent: the processing set contains only statuses a pipeline writes while running (`ingesting`, `extracting_faces`, `body_detecting`).
+
 ---
 
 ## 7. Process & workflow
@@ -485,6 +577,16 @@ Every problem this project has hit since Phase 0 (2026-06) and how it was solved
 - Flex children that bound an image get `minHeight: 0`; overlays lock body scroll; lazy images toggle opacity.
 - Explicit token values, no Tailwind approximations; no `setState` inside effects; helpers in `src/lib/`.
 - Verify headlessly with `textContent` predicates and never click a writing action on the real DB.
+
+**a background step**
+- Start it through `pipeline/jobs.start` (refuses a duplicate run, resets progress); write status only via `crud.update_trip_status`, and never move it backwards on a re-run.
+- Define the second run before the first: what survives, what is replaced, what happens to rows with a user decision; test the second run against a stub.
+- Report failures in the done payload; the UI re-attaches to a running stream on mount.
+
+**a write to the user's Drive (or any external system)**
+- Retries on every call, escaped query literals, one service per thread.
+- Reconcile both ways on re-run (create missing, delete extra) and never read your own output back as input.
+- Plan from the DB in a pure function, dry-run it, then execute.
 
 **a DB column or table**
 - Add it to the model and rely on the startup `ensure_columns`; check `.schema` after restart.

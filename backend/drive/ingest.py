@@ -14,6 +14,14 @@ TEMP_DIR = Path(__file__).parent.parent / "temp"
 DOWNLOAD_WORKERS = 12   # Drive per-user quota (~12k req/min) tolerates far more
 COMMIT_BATCH = 50       # SQLite fsyncs per commit — batch rows to avoid 1 fsync/photo
 
+OUTPUT_FOLDER_NAME = "[Organized]"   # our own output tree inside the source folder — never source material
+FOLDER_MIME = "application/vnd.google-apps.folder"
+SHORTCUT_MIME = "application/vnd.google-apps.shortcut"
+
+# A re-ingest that adds nothing new puts the trip back where it was; a run that
+# was interrupted mid-step comes back at the stable state before that step.
+_STABLE_STATUS = {"ingesting": "ingested", "extracting_faces": "ingested", "body_detecting": "uploaded"}
+
 
 # ── Progress tracking (in-memory, single-user tool) ───────────────────────────
 
@@ -51,10 +59,14 @@ def extract_folder_id(url_or_id: str) -> str:
     return url_or_id.strip()
 
 
-def _list_files(service, folder_id: str, parent_name: str = "") -> list[dict]:
+def _list_files(service, folder_id: str, parent_name: str = "", skip_folder_ids: set[str] | None = None) -> list[dict]:
     """
-    Recursively list all image/RAW files in a Drive folder.
+    Recursively list all image/RAW/video files in a Drive folder.
     Returns list of dicts with id, name, mimeType, md5Checksum, size, parent_folder_name.
+
+    Skips our own output tree ([Organized] by name, plus `skip_folder_ids`) and
+    every shortcut: after an upload the source folder holds ~1700 shortcuts named
+    like the photos, and get_media on a shortcut serves nothing.
     """
     files = []
     page_token = None
@@ -72,9 +84,13 @@ def _list_files(service, folder_id: str, parent_name: str = "") -> list[dict]:
             mime = f.get("mimeType", "")
             name = f.get("name", "")
 
-            if mime == "application/vnd.google-apps.folder":
+            if mime == FOLDER_MIME:
+                if name == OUTPUT_FOLDER_NAME or (skip_folder_ids and f["id"] in skip_folder_ids):
+                    continue
                 # Recurse — folder name becomes parent hint (camera owner)
-                files.extend(_list_files(service, f["id"], parent_name=name))
+                files.extend(_list_files(service, f["id"], parent_name=name, skip_folder_ids=skip_folder_ids))
+            elif mime == SHORTCUT_MIME:
+                continue
             elif is_supported_file(name):
                 f["parent_folder_name"] = parent_name
                 files.append(f)
@@ -160,7 +176,8 @@ def run_ingestion(trip_id: str) -> None:
     Downloads run in parallel; DB writes happen only on this thread, committed in
     batches. Exact duplicates (same Drive md5Checksum) are detected *before*
     download and never fetched. Already-ingested files (re-run after a crash)
-    are skipped entirely.
+    are skipped entirely; rows whose cached file is gone (Clear Cache) are
+    re-downloaded into the same row, so faces and enrollment stay attached.
     """
     from drive.auth import get_drive_service
 
@@ -172,13 +189,18 @@ def run_ingestion(trip_id: str) -> None:
             _update(trip_id, status="error", error="Trip not found")
             return
 
+        prior = trip.last_good_status if trip.status == "failed" else trip.status
+        prior = _STABLE_STATUS.get(prior, prior)
+        source_folder_id = trip.drive_folder_id
+        skip_folders = {trip.output_folder_id} if trip.output_folder_id else None
+
         crud.update_trip_status(session, trip_id, "ingesting")
         _update(trip_id, status="listing", total_files=0, downloaded=0, processed=0,
                 raw_count=0, video_count=0, duplicate_count=0, failed_count=0)
 
         # Step 1 — Authenticate + list all files
         service = get_drive_service()
-        all_files = _list_files(service, trip.drive_folder_id)
+        all_files = _list_files(service, source_folder_id, skip_folder_ids=skip_folders)
         total = len(all_files)
 
         trip_temp = TEMP_DIR / trip_id
@@ -191,14 +213,22 @@ def run_ingestion(trip_id: str) -> None:
         duplicate_count = sum(1 for p in existing.values() if p.is_duplicate)
         failed_count = 0
 
+        # Rows whose cached file is gone are re-downloaded into the same row below.
+        # They must not seed the dedupe maps, or the pre-pass finds each one as an
+        # exact duplicate of itself and inserts a junk row instead of downloading.
+        missing_file = {
+            fid for fid, p in existing.items()
+            if not p.is_duplicate and not (p.local_path and Path(p.local_path).exists())
+        }
+
         # Seed dedupe maps from existing rows (md5 = exact, phash = near-dup)
         md5_to_photo: dict[str, str] = {
-            p.md5_checksum: p.id for p in existing.values()
-            if p.md5_checksum and not p.is_duplicate
+            p.md5_checksum: p.id for fid, p in existing.items()
+            if p.md5_checksum and not p.is_duplicate and fid not in missing_file
         }
         phash_to_photo: dict[str, str] = {
-            p.perceptual_hash: p.id for p in existing.values()
-            if p.perceptual_hash and not p.is_duplicate
+            p.perceptual_hash: p.id for fid, p in existing.items()
+            if p.perceptual_hash and not p.is_duplicate and fid not in missing_file
         }
 
         pending: list[dict] = []
@@ -234,6 +264,7 @@ def run_ingestion(trip_id: str) -> None:
         drive_to_photo: dict[str, str] = {}   # drive_file_id → photo.id (this run)
         processed = skipped_existing
         uncommitted = 0
+        inserted_new = 0                      # rows that did not exist before → later steps must run again
 
         def _flush():
             nonlocal uncommitted
@@ -257,6 +288,27 @@ def run_ingestion(trip_id: str) -> None:
                 file_type = res["file_type"]
                 is_raw = file_type == "raw"
                 is_video = file_type == "video"
+
+                prev = existing.get(f["id"])
+                if prev is not None:
+                    # Re-download into the existing row: same id (faces and enrollment
+                    # reference it), same duplicate verdict, fresh path/hash/EXIF.
+                    prev.local_path = str(res["dest"])
+                    prev.perceptual_hash = res["phash"] or prev.perceptual_hash
+                    prev.exif_timestamp = res["exif_dt"] or prev.exif_timestamp
+                    prev.exif_device = res["exif_device"] or prev.exif_device
+                    prev.md5_checksum = f.get("md5Checksum") or prev.md5_checksum
+                    uncommitted += 1
+                    drive_to_photo[f["id"]] = prev.id
+                    if prev.perceptual_hash and not prev.is_duplicate:
+                        phash_to_photo[prev.perceptual_hash] = prev.id
+                    processed += 1
+                    if uncommitted >= COMMIT_BATCH:
+                        _flush()
+                    _update(trip_id, processed=processed,
+                            raw_count=raw_count, video_count=video_count,
+                            duplicate_count=duplicate_count, failed_count=failed_count)
+                    continue
 
                 # Near-duplicate check (pHash) — images only, single-threaded here
                 phash = res["phash"]
@@ -286,6 +338,7 @@ def run_ingestion(trip_id: str) -> None:
                 )
                 session.add(photo)
                 uncommitted += 1
+                inserted_new += 1
 
                 drive_to_photo[f["id"]] = photo.id
                 if phash and not is_duplicate:
@@ -329,7 +382,11 @@ def run_ingestion(trip_id: str) -> None:
             processed += 1
         session.commit()
 
-        crud.update_trip_status(session, trip_id, "ingested")
+        # New photos need faces again; a re-download-only run leaves the trip where it was.
+        if inserted_new or md5_dups or prior in (None, "created", "ingested", "failed"):
+            crud.update_trip_status(session, trip_id, "ingested")
+        else:
+            crud.update_trip_status(session, trip_id, prior)
         _update(trip_id,
                 status="done",
                 total_files=total,
@@ -349,6 +406,10 @@ def run_ingestion(trip_id: str) -> None:
 
 
 def start_ingestion_thread(trip_id: str) -> None:
-    """Kick off ingestion in a daemon thread so the API returns immediately."""
-    thread = threading.Thread(target=run_ingestion, args=(trip_id,), daemon=True)
-    thread.start()
+    from pipeline.jobs import start
+
+    def reset() -> None:
+        with _progress_lock:
+            _progress[trip_id] = {"status": "waiting"}
+
+    start("ingest", trip_id, run_ingestion, reset)

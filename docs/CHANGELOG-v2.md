@@ -204,3 +204,33 @@ Prem's three bug reports after the Misc redefinition, plus what fixing them unco
 **Gallery lightbox.** A portrait photo rendered 1547 px tall in an 813 px viewport and the wheel scrolled the grid behind the overlay: the image container is a `flex: 1` item whose default `min-height: auto` let the image's `maxHeight: 100%` resolve against itself. `minHeight: 0` + `overflow: hidden` on the photo column and container, and body scroll is locked while the lightbox is open. Measured after: 703 px tall, page scroll stays at 0.
 
 **Docs:** `docs/LESSONS.md` — every problem hit since Phase 0 with its root cause and prevention rule, grouped by area, plus a checklist for new pipeline steps, models, endpoints, overlays and DB columns.
+
+---
+
+# Audit fixes before the first upload — 2026-09-29 (evening)
+
+Two read-only audits (backend, frontend) after the morning's fixes; everything below was verified against the code and, where possible, exercised.
+
+**Upload path (`drive/output.py`)**
+- **Videos** get a `Videos/` folder — the README promised it, the planner skipped them (Kochi: 12 `.MOV`; plan 1705 → 1717 shortcuts).
+- **Drive calls retry** (`num_retries=5`; the client's default is zero) and shortcut failures are **counted** into the upload progress (`failed`) and shown on the trip page — before, a 403 rate-limit burst silently left photos out of the tree while the trip said "uploaded".
+- **Re-upload prunes stale shortcuts:** into an existing `[Organized]`, every folder on Drive is listed and shortcuts whose target isn't planned for that folder are deleted (only shortcuts, never folders or files). A photo moved out of Misc by Review, or reassigned in the gallery, now leaves its old folder. Unit-checked against a fake Drive tree.
+- Drive query strings escape quotes (`_q`), so a person or file named `O'Brien` no longer 400s the upload.
+- **One run per step per trip** (`pipeline/jobs.py`): a second Upload/Classify/Faces/Ingest/Body start while one is running returns 409, and each start resets the step's progress so a subscriber never reads the previous run's "done". Before, a reload mid-upload showed the Upload button again and a second click raced the first into duplicate folders.
+- Re-run rules: classify accepts `uploaded`/`body_detected` and never rolls the status back; upload accepts `body_detected` likewise.
+
+**Bookkeeping**
+- Gallery reassign links the new person to the trip, moves the registry embedding made from that face, and Sync no longer deletes a person's shortcut while another face of theirs is still in the photo.
+- Review assign/bulk-assign link the person to the trip; bulk assign/dismiss (Review and Enroll) act only on this trip's unassigned faces.
+- Removing a person from a trip deletes the registry embeddings made from that trip's photos — otherwise the next classify re-matched the freed faces against themselves and undid the removal.
+
+**Ingest (`drive/ingest.py`)**
+- Re-ingest after Clear Cache used to find every photo as an exact duplicate *of itself* (its own md5 seeded the dedupe map) and insert 1139 junk rows while the originals kept dead paths. Rows whose file is gone are now re-downloaded **into the same row** (faces and enrollment stay attached).
+- Our own `[Organized]` tree and every shortcut are skipped when listing the source folder (after an upload it holds ~1700 shortcuts named like the photos).
+- A re-ingest that adds nothing keeps the trip's status; new photos put it back at `ingested` (faces again). Exercised end-to-end against a stubbed Drive and a temp DB: 2 rows → 2 rows, file restored, status kept; new file → 3 rows, `ingested`.
+
+**Frontend**
+- Gallery no longer awaits the sync check on load (its Drive-verifying variant is now opt-in on the backend, `?verify=1`); after an upload with a dead token the page used to hang behind OAuth.
+- TripDetail re-attaches to a run already in flight after a reload (probing the classify/upload streams), shows action failures inline instead of replacing the page, and closes its progress streams on unmount.
+- Enroll: a held Enter key can't create a person twice; Remove resets session state keyed by the per-run cluster ids (they get renumbered).
+- Review "Verify These" no longer goes blank after clearing the queue and re-running; the Home card no longer shows a resting `classified` trip as processing.

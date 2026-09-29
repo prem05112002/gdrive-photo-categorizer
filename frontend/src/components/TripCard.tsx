@@ -4,7 +4,7 @@ import type { Trip } from '../api/client'
 import { StatusPill } from './StatusPill'
 
 const PROCESSING_STATUSES = new Set([
-  'ingesting', 'extracting_faces', 'classified', 'body_detecting',
+  'ingesting', 'extracting_faces', 'body_detecting',
 ])
 
 interface Props {

@@ -4,8 +4,12 @@ from typing import Callable
 
 from database.models import SessionLocal, Photo, FaceObservation, Person, TripPerson, Trip
 from database import crud
+from drive.ingest import OUTPUT_FOLDER_NAME
 
 UPLOAD_WORKERS = 10   # parallel shortcut creation — Drive write quota tolerates this
+DRIVE_RETRIES = 5     # googleapiclient backs off on 5xx / 429 / 403 rate limits; default is 0 retries
+SHORTCUT_MIME = "application/vnd.google-apps.shortcut"
+FOLDER_MIME = "application/vnd.google-apps.folder"
 
 _upload_progress: dict[str, dict] = {}
 
@@ -27,34 +31,35 @@ def _thread_service():
 
 # ── Drive helpers ───────────────────────────────────────────────────────────────
 
+def _q(value: str) -> str:
+    """Escape a value for a Drive `q` string literal — a name with a quote used to 400 the whole upload."""
+    return value.replace("\\", "\\\\").replace("'", "\\'")
+
+
 def create_folder(service, name: str, parent_id: str) -> str:
-    meta = {
-        "name": name,
-        "mimeType": "application/vnd.google-apps.folder",
-        "parents": [parent_id],
-    }
-    return service.files().create(body=meta, fields="id").execute()["id"]
+    meta = {"name": name, "mimeType": FOLDER_MIME, "parents": [parent_id]}
+    return service.files().create(body=meta, fields="id").execute(num_retries=DRIVE_RETRIES)["id"]
 
 
 def create_shortcut(service, target_file_id: str, name: str, parent_folder_id: str) -> str:
     meta = {
         "name": name,
-        "mimeType": "application/vnd.google-apps.shortcut",
+        "mimeType": SHORTCUT_MIME,
         "shortcutDetails": {"targetId": target_file_id},
         "parents": [parent_folder_id],
     }
-    return service.files().create(body=meta, fields="id").execute()["id"]
+    return service.files().create(body=meta, fields="id").execute(num_retries=DRIVE_RETRIES)["id"]
 
 
 def get_or_create_shortcut(service, target_file_id: str, name: str, parent_folder_id: str) -> str:
     """Idempotent shortcut creation — skips if a shortcut to the same target already exists."""
     resp = service.files().list(
         q=(
-            f"name='{name}' and '{parent_folder_id}' in parents"
-            f" and mimeType='application/vnd.google-apps.shortcut' and trashed=false"
+            f"name='{_q(name)}' and '{parent_folder_id}' in parents"
+            f" and mimeType='{SHORTCUT_MIME}' and trashed=false"
         ),
         fields="files(id, shortcutDetails)",
-    ).execute()
+    ).execute(num_retries=DRIVE_RETRIES)
     for f in resp.get("files", []):
         if f.get("shortcutDetails", {}).get("targetId") == target_file_id:
             return f["id"]
@@ -69,13 +74,67 @@ def get_or_create_folder(service, name: str, parent_id: str) -> str:
 def _get_or_create_folder(service, name: str, parent_id: str) -> tuple[str, bool]:
     """Returns (folder_id, created) — created=False means it already existed."""
     resp = service.files().list(
-        q=f"name='{name}' and '{parent_id}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false",
+        q=f"name='{_q(name)}' and '{parent_id}' in parents and mimeType='{FOLDER_MIME}' and trashed=false",
         fields="files(id)",
-    ).execute()
+    ).execute(num_retries=DRIVE_RETRIES)
     files = resp.get("files", [])
     if files:
         return files[0]["id"], False
     return create_folder(service, name, parent_id), True
+
+
+def _list_children(service, parent_id: str, mime: str) -> list[dict]:
+    """Every non-trashed child of `parent_id` with the given MIME type (paginated)."""
+    out: list[dict] = []
+    token = None
+    while True:
+        resp = service.files().list(
+            q=f"'{parent_id}' in parents and mimeType='{mime}' and trashed=false",
+            fields="nextPageToken, files(id, name, shortcutDetails)",
+            pageSize=1000,
+            pageToken=token,
+        ).execute(num_retries=DRIVE_RETRIES)
+        out.extend(resp.get("files", []))
+        token = resp.get("nextPageToken")
+        if not token:
+            return out
+
+
+def prune_stale_shortcuts(service, root_id: str, planned: dict[tuple[str, ...], set[str]]) -> list[str]:
+    """
+    Re-upload into an existing [Organized] tree: delete every shortcut whose
+    target is not planned for the folder it sits in, so a photo moved out of
+    Misc by Review (or reassigned in the gallery) leaves its old folder. Walks
+    the folders that exist on Drive, not just the plan's, so a folder emptied
+    by the plan is emptied on Drive too. Only shortcuts are deleted — never a
+    folder, never a target file. Returns the deleted shortcut ids.
+    """
+    folders: list[tuple[tuple[str, ...], str]] = []
+    for top in _list_children(service, root_id, FOLDER_MIME):
+        if top["name"] == "Places":
+            folders.extend((("Places", sub["name"]), sub["id"]) for sub in _list_children(service, top["id"], FOLDER_MIME))
+        else:
+            folders.append(((top["name"],), top["id"]))
+
+    stale: list[str] = []
+    for path, folder_id in folders:
+        keep = planned.get(path, set())
+        for sc in _list_children(service, folder_id, SHORTCUT_MIME):
+            if sc.get("shortcutDetails", {}).get("targetId") not in keep:
+                stale.append(sc["id"])
+
+    def delete(shortcut_id: str) -> str:
+        _thread_service().files().delete(fileId=shortcut_id).execute(num_retries=DRIVE_RETRIES)
+        return shortcut_id
+
+    removed: list[str] = []
+    with ThreadPoolExecutor(max_workers=UPLOAD_WORKERS) as pool:
+        for fut in as_completed([pool.submit(delete, sid) for sid in stale]):
+            try:
+                removed.append(fut.result())
+            except Exception as e:
+                print(f"[upload] warning: could not delete stale shortcut: {e}")
+    return removed
 
 
 # ── Output planner ──────────────────────────────────────────────────────────────
@@ -131,7 +190,10 @@ def plan_trip_output(session, trip_id: str) -> list[dict]:
         })
 
     for photo in photos:
-        if photo.is_video or photo.is_duplicate:
+        if photo.is_duplicate:
+            continue
+        if photo.is_video:
+            add(photo, ("Videos",))
             continue
         if photo.is_raw:
             add(photo, ("RAW",))
@@ -164,14 +226,16 @@ def build_trip_output(
 
     Folders are created lazily (only the ones the plan needs), then shortcuts
     are created in parallel. Existence checks (1 extra API call per shortcut)
-    only run when [Organized] already existed — a fresh tree can't collide.
+    only run when [Organized] already existed — a fresh tree can't collide —
+    and on that re-upload path shortcuts that no longer belong are deleted
+    afterwards, so the tree ends up matching the plan exactly.
 
-    Returns (shortcuts_created, root_folder_id).
+    Returns {"shortcuts": created, "failed": n, "removed": n, "root_id": id}.
     """
     trip = session.query(Trip).filter(Trip.id == trip_id).first()
     plan = plan_trip_output(session, trip_id)
 
-    root_id, root_created = _get_or_create_folder(service, "[Organized]", trip.drive_folder_id)
+    root_id, root_created = _get_or_create_folder(service, OUTPUT_FOLDER_NAME, trip.drive_folder_id)
     safe_mode = not root_created  # re-run into an existing tree → dedupe checks needed
 
     folder_ids: dict[tuple[str, ...], str] = {(): root_id}
@@ -194,6 +258,7 @@ def build_trip_output(
             return get_or_create_shortcut(svc, item["file_id"], item["name"], item["parent_id"])
         return create_shortcut(svc, item["file_id"], item["name"], item["parent_id"])
 
+    failed = 0
     with ThreadPoolExecutor(max_workers=UPLOAD_WORKERS) as pool:
         futures = {pool.submit(make, item): item for item in worklist}
         for fut in as_completed(futures):
@@ -204,6 +269,7 @@ def build_trip_output(
             try:
                 shortcut_id = fut.result()
             except Exception as e:
+                failed += 1
                 print(f"[upload] warning {item['name']}: {e}")
                 continue
             shortcuts += 1
@@ -213,8 +279,21 @@ def build_trip_output(
                     FaceObservation.person_id == item["pid"],
                 ).update({"drive_shortcut_id": shortcut_id}, synchronize_session=False)
 
+    removed: list[str] = []
+    if safe_mode:
+        if progress_callback:
+            progress_callback(done, total, "Removing shortcuts that no longer belong…")
+        planned: dict[tuple[str, ...], set[str]] = {}
+        for item in plan:
+            planned.setdefault(item["folder"], set()).add(item["file_id"])
+        removed = prune_stale_shortcuts(service, root_id, planned)
+        for i in range(0, len(removed), 500):
+            session.query(FaceObservation).filter(
+                FaceObservation.drive_shortcut_id.in_(removed[i:i + 500])
+            ).update({"drive_shortcut_id": None}, synchronize_session=False)
+
     session.commit()
-    return shortcuts, root_id
+    return {"shortcuts": shortcuts, "failed": failed, "removed": len(removed), "root_id": root_id}
 
 
 # ── Upload thread ───────────────────────────────────────────────────────────────
@@ -234,14 +313,21 @@ def _run_upload(trip_id: str) -> None:
         def on_progress(done: int, tot: int, name: str) -> None:
             _upload_progress[trip_id].update({"uploaded": done, "total": tot, "current": name})
 
-        shortcuts, root_id = build_trip_output(service, session, trip_id, on_progress)
+        result = build_trip_output(service, session, trip_id, on_progress)
+        root_id = result["root_id"]
 
         session.query(Trip).filter(Trip.id == trip_id).update({"output_folder_id": root_id})
-        crud.update_trip_status(session, trip_id, "uploaded")  # also refreshes last_good_status
+        session.commit()
+        session.expire_all()
+        current = session.query(Trip.status).filter(Trip.id == trip_id).scalar()
+        # a re-upload after body detection keeps that status; the helper refreshes last_good_status either way
+        crud.update_trip_status(session, trip_id, "uploaded" if current in ("classified", "failed") else current)
 
         _upload_progress[trip_id] = {
             "status": "done",
-            "total_shortcuts": shortcuts,
+            "total_shortcuts": result["shortcuts"],
+            "failed": result["failed"],     # Drive refused these even after retries — a Re-upload fills the gaps
+            "removed": result["removed"],
             "output_url": f"https://drive.google.com/drive/folders/{root_id}",
         }
 
@@ -260,4 +346,9 @@ def _run_upload(trip_id: str) -> None:
 
 
 def start_upload_thread(trip_id: str) -> None:
-    threading.Thread(target=_run_upload, args=(trip_id,), daemon=True).start()
+    from pipeline.jobs import start
+
+    def reset() -> None:
+        _upload_progress[trip_id] = {"status": "waiting"}
+
+    start("upload", trip_id, _run_upload, reset)

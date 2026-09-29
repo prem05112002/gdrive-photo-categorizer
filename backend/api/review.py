@@ -74,6 +74,7 @@ def assign_misc_face(
 
     face.person_id = person.id
     session.commit()
+    crud.add_person_to_trip(session, trip_id, person.id)
 
     return {"assigned": True, "person_id": person.id, "person_name": person.name}
 
@@ -174,7 +175,17 @@ def bulk_assign_misc(trip_id: str, payload: BulkAssignPayload, session: Session 
     if not person:
         raise HTTPException(404, "Person not found")
 
-    faces = session.query(FaceObservation).filter(FaceObservation.id.in_(payload.face_ids)).all()
+    # only this trip's still-unassigned faces — ids from a stale tab or another trip are ignored
+    faces = (
+        session.query(FaceObservation)
+        .join(Photo, Photo.id == FaceObservation.photo_id)
+        .filter(
+            Photo.trip_id == trip_id,
+            FaceObservation.id.in_(payload.face_ids),
+            FaceObservation.person_id.is_(None),
+        )
+        .all()
+    )
     for face in faces:
         if face.raw_embedding:
             session.add(PersonEmbedding(
@@ -185,6 +196,7 @@ def bulk_assign_misc(trip_id: str, payload: BulkAssignPayload, session: Session 
             ))
         face.person_id = person.id
     session.commit()
+    crud.add_person_to_trip(session, trip_id, person.id)
     return {"assigned": len(faces), "person_id": person.id}
 
 
@@ -196,7 +208,11 @@ class BulkDismissPayload(BaseModel):
 def bulk_dismiss_misc(trip_id: str, payload: BulkDismissPayload, session: Session = Depends(get_session)):
     updated = (
         session.query(FaceObservation)
-        .filter(FaceObservation.id.in_(payload.face_ids))
+        .filter(
+            FaceObservation.id.in_(payload.face_ids),
+            FaceObservation.person_id.is_(None),   # never dismiss a face somebody is named on
+            FaceObservation.photo_id.in_(session.query(Photo.id).filter(Photo.trip_id == trip_id)),
+        )
         .update({"is_stranger": True}, synchronize_session=False)
     )
     session.commit()

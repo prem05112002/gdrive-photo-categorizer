@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import {
   AlertTriangle, Loader2, FileImage, FileScan,
@@ -42,7 +42,8 @@ export function TripDetail() {
   const [bodyDetecting, setBodyDetecting] = useState(false)
   const [faceStats, setFaceStats] = useState<{ total_faces: number; photos_with_faces: number; group_photo_candidates: number } | null>(null)
   const [classifyResults, setClassifyResults] = useState<ClassifyResults | null>(null)
-  const [error, setError] = useState<string | null>(null)
+  const [error, setError] = useState<string | null>(null)             // trip failed to load → full-page
+  const [actionError, setActionError] = useState<string | null>(null) // a step failed to start → inline banner
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false)
   const [deleting, setDeleting] = useState(false)
 
@@ -51,11 +52,13 @@ export function TripDetail() {
     try {
       const data = await api.trips.get(id)
       setTrip(data)
-      if (STATUSES_PAST_FACES.includes(data.status)) {
+      // a failed trip keeps the results of the step it last completed
+      const effective = data.status === 'failed' && data.last_good_status ? data.last_good_status : data.status
+      if (STATUSES_PAST_FACES.includes(effective)) {
         const stats = await api.pipeline.faceStats(id)
         setFaceStats(stats)
       }
-      if (STATUSES_PAST_CLASSIFY.includes(data.status)) {
+      if (STATUSES_PAST_CLASSIFY.includes(effective)) {
         const results = await api.classify.results(id)
         setClassifyResults(results)
       }
@@ -66,62 +69,104 @@ export function TripDetail() {
 
   useEffect(() => { loadTrip() }, [loadTrip])
 
+  // Every open progress stream, closed on unmount — navigating away mid-run used
+  // to leave the EventSource alive until the run finished.
+  const closers = useRef<(() => void)[]>([])
+  const track = useCallback((close: () => void) => { closers.current.push(close) }, [])
+  useEffect(() => () => { closers.current.forEach(close => close()) }, [])
+
+  // Re-attach to a run that is already in flight (reload or navigation mid-step).
+  // Ingest, faces and bodies mark the trip status; classify and upload don't, so
+  // their streams are probed: the first event is "running" while a run is on, and
+  // "waiting" or the previous run's result otherwise (then the probe closes).
+  const attached = useRef(false)
+  useEffect(() => {
+    if (!id || !trip || attached.current) return
+    attached.current = true
+    const refresh = () => loadTrip()
+    function probe<P extends { status: string }>(
+      open: (tripId: string, onProgress: (p: P) => void, onDone: () => void) => () => void,
+      setProgress: (p: P) => void,
+      setRunning: (v: boolean) => void,
+    ) {
+      let first = true
+      const close = open(id!, p => {
+        if (first) {
+          first = false
+          if (p.status !== 'running') { close(); return }
+          setRunning(true)
+        }
+        setProgress(p)
+      }, () => { setRunning(false); refresh() })
+      track(close)
+    }
+    if (trip.status === 'ingesting')        track(api.processing.streamProgress(id, setIngestProgress, refresh))
+    if (trip.status === 'extracting_faces') track(api.pipeline.streamFaceProgress(id, setFaceProgress, refresh))
+    if (trip.status === 'body_detecting')   track(api.body.streamProgress(id, setBodyProgress, refresh))
+    if (['enrolled', 'classified', 'uploaded', 'body_detected'].includes(trip.status)) {
+      probe(api.classify.streamProgress, setClassifyProgress, setClassifying)
+    }
+    if (['classified', 'uploaded', 'body_detected'].includes(trip.status)) {
+      probe(api.classify.streamUploadProgress, setUploadProgress, setUploading)
+    }
+  }, [id, trip, loadTrip, track])
+
   async function startIngestion() {
     if (!id) return
-    setIngesting(true); setError(null)
+    setIngesting(true); setActionError(null)
     try {
       await api.processing.startIngestion(id)
-      api.processing.streamProgress(id, setIngestProgress, () => { setIngesting(false); loadTrip() })
+      track(api.processing.streamProgress(id, setIngestProgress, () => { setIngesting(false); loadTrip() }))
     } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : 'Failed to start ingestion')
+      setActionError(err instanceof Error ? err.message : 'Failed to start ingestion')
       setIngesting(false)
     }
   }
 
   async function startFaceExtraction() {
     if (!id) return
-    setExtracting(true); setError(null)
+    setExtracting(true); setActionError(null)
     try {
       await api.pipeline.startFaceExtraction(id)
-      api.pipeline.streamFaceProgress(id, setFaceProgress, () => { setExtracting(false); loadTrip() })
+      track(api.pipeline.streamFaceProgress(id, setFaceProgress, () => { setExtracting(false); loadTrip() }))
     } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : 'Failed to start face extraction')
+      setActionError(err instanceof Error ? err.message : 'Failed to start face extraction')
       setExtracting(false)
     }
   }
 
   async function startClassify() {
     if (!id) return
-    setClassifying(true); setError(null)
+    setClassifying(true); setActionError(null)
     try {
       await api.classify.run(id)
-      api.classify.streamProgress(id, setClassifyProgress, () => { setClassifying(false); loadTrip() })
+      track(api.classify.streamProgress(id, setClassifyProgress, () => { setClassifying(false); loadTrip() }))
     } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : 'Failed to start classification')
+      setActionError(err instanceof Error ? err.message : 'Failed to start classification')
       setClassifying(false)
     }
   }
 
   async function startUpload() {
     if (!id) return
-    setUploading(true); setError(null)
+    setUploading(true); setActionError(null)
     try {
       await api.classify.upload(id)
-      api.classify.streamUploadProgress(id, setUploadProgress, () => { setUploading(false); loadTrip() })
+      track(api.classify.streamUploadProgress(id, setUploadProgress, () => { setUploading(false); loadTrip() }))
     } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : 'Failed to start upload')
+      setActionError(err instanceof Error ? err.message : 'Failed to start upload')
       setUploading(false)
     }
   }
 
   async function startBodyDetection() {
     if (!id) return
-    setBodyDetecting(true); setError(null)
+    setBodyDetecting(true); setActionError(null)
     try {
       await api.body.run(id)
-      api.body.streamProgress(id, setBodyProgress, () => { setBodyDetecting(false); loadTrip() })
+      track(api.body.streamProgress(id, setBodyProgress, () => { setBodyDetecting(false); loadTrip() }))
     } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : 'Failed to start body detection')
+      setActionError(err instanceof Error ? err.message : 'Failed to start body detection')
       setBodyDetecting(false)
     }
   }
@@ -236,6 +281,15 @@ export function TripDetail() {
                   Retry the failed step below.
                 </p>
               </div>
+            </div>
+          )}
+
+          {actionError && (
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '10px 14px', marginBottom: 16, borderRadius: 10, background: 'rgba(239,68,68,.1)', border: '1px solid rgba(239,68,68,.35)', fontSize: 13, color: '#fca5a5' }}>
+              <span style={{ flex: 1 }}>{actionError}</span>
+              <button onClick={() => setActionError(null)} title="Dismiss" style={{ background: 'none', border: 'none', color: '#fca5a5', cursor: 'pointer', display: 'flex', padding: 2 }}>
+                <X size={14} />
+              </button>
             </div>
           )}
 
@@ -363,7 +417,9 @@ export function TripDetail() {
                         ? classifyResults.persons.reduce((s, p) => s + p.photo_count, 0)
                           + Object.values(classifyResults.scene_counts).reduce((a, b) => a + b, 0)
                         : null)
-                    return n != null ? `${n} shortcuts created` : 'Uploaded'
+                    const failed = uploadProgress?.failed ?? 0
+                    return (n != null ? `${n} shortcuts created` : 'Uploaded')
+                      + (failed > 0 ? ` · ${failed} failed — Re-upload to retry` : '')
                   })()}
                 </p>
                 <button

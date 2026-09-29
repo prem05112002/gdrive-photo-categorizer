@@ -98,7 +98,9 @@ def _run_classify(trip_id: str) -> None:
         scenes_labeled = classify_scenes(session, trip_id, on_progress)
 
         session.expire_all()
-        crud.update_trip_status(session, trip_id, "classified")  # also refreshes last_good_status
+        current = session.query(Trip.status).filter(Trip.id == trip_id).scalar()
+        # first classification moves the trip forward; a re-run after upload keeps its status
+        crud.update_trip_status(session, trip_id, "classified" if current in ("enrolled", "failed") else current)
         _classify_progress[trip_id] = {
             "status": "done",
             "faces_matched": faces_matched,
@@ -120,4 +122,9 @@ def _run_classify(trip_id: str) -> None:
 
 
 def start_classify_thread(trip_id: str) -> None:
-    threading.Thread(target=_run_classify, args=(trip_id,), daemon=True).start()
+    from pipeline.jobs import start
+
+    def reset() -> None:
+        _classify_progress[trip_id] = {"status": "waiting"}
+
+    start("classify", trip_id, _run_classify, reset)

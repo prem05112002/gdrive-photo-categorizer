@@ -7,6 +7,7 @@ from sse_starlette.sse import EventSourceResponse
 
 from database.models import get_session, FaceObservation, Photo, TripPerson, Person
 from database import crud
+from pipeline.jobs import JobRunning
 from pipeline.classify import start_classify_thread, get_classify_progress
 from drive.output import start_upload_thread, get_upload_progress
 
@@ -20,9 +21,12 @@ def start_classify(trip_id: str, session: Session = Depends(get_session)):
         raise HTTPException(404, "Trip not found")
     # Re-running on a classified trip is idempotent: matching only touches
     # unassigned faces, scene labelling only fills photos without a label.
-    if trip.status not in ("enrolled", "classified", "failed"):
-        raise HTTPException(409, f"Classification requires status 'enrolled' or 'classified', current: '{trip.status}'")
-    start_classify_thread(trip_id)
+    if trip.status not in ("enrolled", "classified", "uploaded", "body_detected", "failed"):
+        raise HTTPException(409, f"Classification requires status 'enrolled' or later, current: '{trip.status}'")
+    try:
+        start_classify_thread(trip_id)
+    except JobRunning as e:
+        raise HTTPException(409, str(e))
     return {"status": "started", "trip_id": trip_id}
 
 
@@ -43,9 +47,12 @@ def start_upload(trip_id: str, session: Session = Depends(get_session)):
     trip = crud.get_trip(session, trip_id)
     if not trip:
         raise HTTPException(404, "Trip not found")
-    if trip.status not in ("classified", "failed", "uploaded"):
+    if trip.status not in ("classified", "failed", "uploaded", "body_detected"):
         raise HTTPException(409, f"Upload requires status 'classified', current: '{trip.status}'")
-    start_upload_thread(trip_id)
+    try:
+        start_upload_thread(trip_id)
+    except JobRunning as e:
+        raise HTTPException(409, str(e))
     return {"status": "started", "trip_id": trip_id}
 
 

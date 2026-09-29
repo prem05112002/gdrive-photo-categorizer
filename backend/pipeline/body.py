@@ -293,4 +293,9 @@ def _run_body(trip_id: str) -> None:
 
 
 def start_body_thread(trip_id: str) -> None:
-    threading.Thread(target=_run_body, args=(trip_id,), daemon=True).start()
+    from pipeline.jobs import start
+
+    def reset() -> None:
+        _body_progress[trip_id] = {"status": "waiting"}
+
+    start("body", trip_id, _run_body, reset)

@@ -133,6 +133,8 @@ export interface UploadProgress {
   uploaded?: number
   current?: string
   total_shortcuts?: number
+  failed?: number          // shortcuts Drive refused even after retries — Re-upload fills the gaps
+  removed?: number         // stale shortcuts pruned on a re-upload
   output_url?: string
   error?: string
 }

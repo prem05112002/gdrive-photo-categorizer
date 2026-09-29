@@ -1,12 +1,12 @@
 import shutil
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
-from database.models import get_session, FaceObservation, Photo, Person, TripPerson, Trip, UserCorrection
+from database.models import get_session, FaceObservation, Photo, Person, PersonEmbedding, TripPerson, Trip, UserCorrection
 from database import crud
 from drive.output import get_or_create_folder, get_or_create_shortcut
 
@@ -44,6 +44,15 @@ def reassign_face(
 
     old_person_id = face.person_id
     face.person_id = payload.new_person_id
+    # The registry embedding made from this face follows it, or the old person keeps
+    # a lookalike entry that blocks future matches of the new one (margin rule).
+    if old_person_id and face.raw_embedding is not None:
+        session.query(PersonEmbedding).filter(
+            PersonEmbedding.person_id == old_person_id,
+            PersonEmbedding.source_photo_id == photo.id,
+            PersonEmbedding.embedding == face.raw_embedding,
+        ).update({"person_id": payload.new_person_id}, synchronize_session=False)
+    crud.add_person_to_trip(session, photo.trip_id, payload.new_person_id)  # else the gallery and the plan never see them
 
     correction = UserCorrection(
         trip_id=photo.trip_id,
@@ -107,8 +116,19 @@ def sync_trip(trip_id: str, session: Session = Depends(get_session)):
             if not new_person:
                 raise ValueError("New person not found")
 
-            # Delete old shortcut from Drive
-            if face.drive_shortcut_id:
+            # Delete the old person's shortcut — unless another face of theirs is still
+            # in this photo (the shortcut is per photo, and every face row shares its id).
+            still_theirs = (
+                session.query(FaceObservation)
+                .filter(
+                    FaceObservation.photo_id == photo.id,
+                    FaceObservation.person_id == correction.old_person_id,
+                    FaceObservation.id != face.id,
+                    FaceObservation.is_stranger == False,  # noqa: E712
+                )
+                .count()
+            ) if correction.old_person_id else 0
+            if face.drive_shortcut_id and not still_theirs:
                 try:
                     service.files().delete(fileId=face.drive_shortcut_id).execute()
                 except Exception:
@@ -135,7 +155,17 @@ def sync_trip(trip_id: str, session: Session = Depends(get_session)):
 # ── Sync status ────────────────────────────────────────────────────────────────
 
 @trips_router.get("/{trip_id}/sync-status")
-def sync_status(trip_id: str, session: Session = Depends(get_session)):
+def sync_status(
+    trip_id: str,
+    verify: bool = Query(False, description="Also count Drive shortcuts per person (Drive API calls; may trigger OAuth)"),
+    session: Session = Depends(get_session),
+):
+    """
+    Pending-correction count, and with ?verify=1 a Drive-side check of each
+    person folder. Verification is opt-in: it costs two Drive calls per person
+    and, on a dead token, blocks on the OAuth consent flow — the gallery used
+    to call it on every load and would have hung after upload.
+    """
     trip = crud.get_trip(session, trip_id)
     if not trip:
         raise HTTPException(404, "Trip not found")
@@ -150,8 +180,8 @@ def sync_status(trip_id: str, session: Session = Depends(get_session)):
     if pending_count > 0:
         return {"pending_count": pending_count, "mismatches": []}
 
-    # Tier 2: Drive verification (only when no pending corrections)
-    if not trip.output_folder_id:
+    # Tier 2: Drive verification (opt-in, only when no pending corrections)
+    if not verify or not trip.output_folder_id:
         return {"pending_count": 0, "mismatches": []}
 
     from drive.auth import get_drive_service

@@ -235,7 +235,11 @@ class DismissPayload(BaseModel):
 def dismiss_cluster(trip_id: str, payload: DismissPayload, session: Session = Depends(get_session)):
     updated = (
         session.query(FaceObservation)
-        .filter(FaceObservation.id.in_(payload.face_ids))
+        .filter(
+            FaceObservation.id.in_(payload.face_ids),
+            FaceObservation.person_id.is_(None),   # never dismiss a face somebody is named on
+            FaceObservation.photo_id.in_(session.query(Photo.id).filter(Photo.trip_id == trip_id)),
+        )
         .update({"is_stranger": True}, synchronize_session=False)
     )
     session.commit()
@@ -311,6 +315,13 @@ def delete_enrolled_person(trip_id: str, person_id: str, session: Session = Depe
     session.execute(text(
         "UPDATE face_observations SET person_id = NULL, is_stranger = 0 "
         "WHERE person_id = :pid AND photo_id IN (SELECT id FROM photos WHERE trip_id = :tid)"
+    ), {"pid": person_id, "tid": trip_id})
+
+    # Registry embeddings made from this trip's photos go too, or the next classify
+    # re-matches the freed faces against themselves and undoes the removal.
+    session.execute(text(
+        "DELETE FROM person_embeddings WHERE person_id = :pid "
+        "AND source_photo_id IN (SELECT id FROM photos WHERE trip_id = :tid)"
     ), {"pid": person_id, "tid": trip_id})
 
     session.execute(text(

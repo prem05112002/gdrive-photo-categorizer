@@ -13,7 +13,7 @@ const CONFIGS: Record<string, Config> = {
   extracting_faces:  { dotColor: '#7C6EF8', textColor: '#c4b5fd',  bg: 'rgba(124,110,248,.18)', label: 'Extracting Faces', pulse: true },
   faces_extracted:   { dotColor: '#22C55E', textColor: '#86efac',  bg: 'rgba(34,197,94,.16)',   label: 'Faces Extracted' },
   enrolled:          { dotColor: '#7C6EF8', textColor: '#c4b5fd',  bg: 'rgba(124,110,248,.18)', label: 'Ready to Classify' },
-  classified:        { dotColor: '#7C6EF8', textColor: '#c4b5fd',  bg: 'rgba(124,110,248,.18)', label: 'Classified',       pulse: true },
+  classified:        { dotColor: '#22C55E', textColor: '#86efac',  bg: 'rgba(34,197,94,.16)',   label: 'Classified' },
   uploaded:          { dotColor: '#22C55E', textColor: '#86efac',  bg: 'rgba(34,197,94,.16)',   label: 'Uploaded' },
   body_detecting:    { dotColor: '#7C6EF8', textColor: '#c4b5fd',  bg: 'rgba(124,110,248,.18)', label: 'Body Detecting',   pulse: true },
   body_detected:     { dotColor: '#22C55E', textColor: '#86efac',  bg: 'rgba(34,197,94,.16)',   label: 'Body Detected' },

@@ -6,6 +6,7 @@ from sse_starlette.sse import EventSourceResponse
 
 from database.models import get_session
 from database import crud
+from pipeline.jobs import JobRunning
 from pipeline.face import start_face_pipeline_thread, get_face_progress
 
 router = APIRouter()
@@ -21,7 +22,10 @@ def start_face_extraction(trip_id: str, session: Session = Depends(get_session))
             status_code=409,
             detail=f"Face extraction requires status 'ingested', current: '{trip.status}'"
         )
-    start_face_pipeline_thread(trip_id)
+    try:
+        start_face_pipeline_thread(trip_id)
+    except JobRunning as e:
+        raise HTTPException(409, str(e))
     return {"status": "started", "trip_id": trip_id}
 
 

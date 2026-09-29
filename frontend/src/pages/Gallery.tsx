@@ -72,15 +72,16 @@ export function Gallery() {
   const loadAll = useCallback(async () => {
     if (!tripId) return
     try {
-      const [trip, galleryData, syncStatus] = await Promise.all([
+      const [trip, galleryData] = await Promise.all([
         api.trips.get(tripId),
         api.gallery.get(tripId),
-        api.sync.syncStatus(tripId),
       ])
       setTripName(trip.name)
       setOutputFolderId(trip.output_folder_id)
       setGallery(galleryData)
-      setPendingCount(syncStatus.pending_count)
+      // Secondary: the pending-correction badge must never block or fail the page
+      // (its Drive-verifying variant used to sit behind OAuth after an upload).
+      api.sync.syncStatus(tripId).then(s => setPendingCount(s.pending_count)).catch(() => {})
       setSelectedFolder(prev => {
         const valid = prev != null && (
           prev === 'misc'

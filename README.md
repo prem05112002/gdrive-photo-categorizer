@@ -399,7 +399,7 @@ Open **http://localhost:5173** — that's the only URL you need to use.
 - **One coordinate space** — face and body bounding boxes are both stored in 1920-long-side detection space; anything rendering onto the original image applies one scale factor.
 - **One encoder, three jobs** — a single shared SigLIP 2 instance handles scene labels, outfit fingerprints, and misclassification checks.
 - **Shortcuts, not copies** — the Drive upload step creates `application/vnd.google-apps.shortcut` files, so every photo appears in person and scene folders without consuming additional Drive storage.
-- **Resumable by design** — ingest skips already-downloaded files, face extraction clears its own partial output, and re-running the upload into an existing `[Organized]/` tree checks for existing shortcuts before creating new ones.
+- **Resumable by design** — ingest skips already-downloaded files and re-downloads a cleared cache into the same rows, face extraction keeps every named or dismissed face across re-runs, and re-running the upload into an existing `[Organized]/` tree adds what is missing and removes shortcuts that no longer belong, so Drive ends up matching the app.
 
 Full details of the v2 optimization pass (what changed and why, plus every tuning threshold): [`docs/CHANGELOG-v2.md`](docs/CHANGELOG-v2.md).
 

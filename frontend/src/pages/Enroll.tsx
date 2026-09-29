@@ -107,6 +107,7 @@ export function Enroll() {
     if (!id) return false
     const name = (nameOverride ?? nameInputs[cluster.cluster_id] ?? '').trim()
     if (!name) return false
+    if (saving.has(cluster.cluster_id)) return false   // a held Enter key or a double click would create the person twice
     setSaving(prev => new Set(prev).add(cluster.cluster_id))
     try {
       const res = await api.enrollment.nameCluster(id, name, cluster.face_ids)
@@ -146,6 +147,12 @@ export function Enroll() {
       ])
       setClusters(clusterData.clusters)
       setGroupPhotos(photosData)
+      // Cluster ids are per-run labels and the refetch renumbered them, so state
+      // keyed by them would mislabel faces; the server already excludes what was named or dismissed.
+      setSavedNames({})
+      setDismissed(new Set())
+      setNameInputs({})
+      setHighlight(null)
     } catch (e) {
       alert(e instanceof Error ? e.message : 'Delete failed')
     } finally {
@@ -157,13 +164,16 @@ export function Enroll() {
   async function confirmSuggestion(cluster: FaceCluster) {
     if (!id || cluster.suggested_cluster_id == null) return
     const target = savedNames[cluster.suggested_cluster_id]
-    if (!target) return
+    if (!target || saving.has(cluster.cluster_id)) return
+    setSaving(prev => new Set(prev).add(cluster.cluster_id))
     try {
       await api.enrollment.assignFaces(id, target.personId, cluster.face_ids)
       setSavedNames(prev => ({ ...prev, [cluster.cluster_id]: target }))
       setEnrolledPersons(await api.enrollment.persons(id))
     } catch (e) {
       alert(e instanceof Error ? e.message : 'Assign failed')
+    } finally {
+      setSaving(prev => { const s = new Set(prev); s.delete(cluster.cluster_id); return s })
     }
   }
 
@@ -707,7 +717,7 @@ function ClusterCard({ cluster, value, onChange, onSave, onOpen, saving, highlig
             type="text"
             value={value}
             onChange={e => onChange(e.target.value)}
-            onKeyDown={e => { if (e.key === 'Enter') onSave() }}
+            onKeyDown={e => { if (e.key === 'Enter' && !e.repeat) onSave() }}
             placeholder="Name this person…"
             style={{
               flex: 1, minWidth: 0, height: 38, border: '1px solid var(--border)', borderRadius: 8,
@@ -801,7 +811,7 @@ function SingletonCard({ cluster, suggestionName, hasSuggestion, onConfirmSugges
           type="text"
           value={val}
           onChange={e => setVal(e.target.value)}
-          onKeyDown={e => { if (e.key === 'Enter' && val.trim()) onName(val.trim()) }}
+          onKeyDown={e => { if (e.key === 'Enter' && !e.repeat && val.trim()) onName(val.trim()) }}
           onBlur={() => { if (!val.trim()) setShowInput(false) }}
           autoFocus
           placeholder="Name…"

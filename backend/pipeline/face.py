@@ -448,5 +448,9 @@ def run_face_pipeline(trip_id: str) -> None:
 
 
 def start_face_pipeline_thread(trip_id: str) -> None:
-    thread = threading.Thread(target=run_face_pipeline, args=(trip_id,), daemon=True)
-    thread.start()
+    from pipeline.jobs import start
+
+    def reset() -> None:
+        _progress[trip_id] = {"status": "waiting"}
+
+    start("faces", trip_id, run_face_pipeline, reset)

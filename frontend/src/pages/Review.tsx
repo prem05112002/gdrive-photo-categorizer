@@ -149,7 +149,7 @@ export function Review() {
     try {
       await api.body.confirmOutfitMatch(id, umId, personId)
       setOutfitMatches(m => m.filter(x => x.id !== umId))
-      setOutfitIdx(i => Math.min(i, outfitMatches.length - 2))
+      setOutfitIdx(i => Math.max(0, Math.min(i, outfitMatches.length - 2)))
       setShowOutfitPicker(false)
       setOutfitPickerPersonId('')
     } catch { /* ignore */ } finally {
@@ -163,7 +163,7 @@ export function Review() {
     try {
       await api.body.dismissOutfitMatch(id, umId)
       setOutfitMatches(m => m.filter(x => x.id !== umId))
-      setOutfitIdx(i => Math.min(i, outfitMatches.length - 2))
+      setOutfitIdx(i => Math.max(0, Math.min(i, outfitMatches.length - 2)))
       setShowOutfitPicker(false)
       setOutfitPickerPersonId('')
     } catch { /* ignore */ } finally {
@@ -179,6 +179,7 @@ export function Review() {
       setAnalysisRan(true)
       const updated = await api.body.misclassifications(id)
       setMisclassifications(updated)
+      setVerifyIdx(0)   // the old index can point past (or before) the new list
     } catch { /* ignore */ } finally {
       setRunningAnalysis(false)
     }
@@ -190,7 +191,7 @@ export function Review() {
     try {
       await api.body.keepClassification(id, pmId)
       setMisclassifications(m => m.filter(x => x.id !== pmId))
-      setVerifyIdx(i => Math.min(i, misclassifications.length - 2))
+      setVerifyIdx(i => Math.max(0, Math.min(i, misclassifications.length - 2)))
     } catch { /* ignore */ } finally {
       setVerifyActing(false)
     }
@@ -202,7 +203,7 @@ export function Review() {
     try {
       await api.body.reassignMisclassification(id, pmId)
       setMisclassifications(m => m.filter(x => x.id !== pmId))
-      setVerifyIdx(i => Math.min(i, misclassifications.length - 2))
+      setVerifyIdx(i => Math.max(0, Math.min(i, misclassifications.length - 2)))
       const newResults = await api.classify.results(id)
       setResults(newResults)
     } catch { /* ignore */ } finally {

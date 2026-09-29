@@ -24,6 +24,7 @@ from database.models import (
     get_session,
 )
 from database import crud
+from pipeline.jobs import JobRunning
 from pipeline.body import start_body_thread, get_body_progress
 
 router = APIRouter()
@@ -113,7 +114,10 @@ def start_body_detection(trip_id: str, session: Session = Depends(get_session)):
         raise HTTPException(404, "Trip not found")
     if trip.status not in ("uploaded", "body_detected", "failed"):
         raise HTTPException(409, f"Body detection requires status 'uploaded', current: '{trip.status}'")
-    start_body_thread(trip_id)
+    try:
+        start_body_thread(trip_id)
+    except JobRunning as e:
+        raise HTTPException(409, str(e))
     return {"status": "started", "trip_id": trip_id}
 
 

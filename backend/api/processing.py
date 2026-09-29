@@ -6,6 +6,7 @@ from sse_starlette.sse import EventSourceResponse
 
 from database.models import get_session
 from database import crud
+from pipeline.jobs import JobRunning
 from drive.ingest import start_ingestion_thread, get_progress
 
 router = APIRouter()
@@ -19,7 +20,10 @@ def start_ingestion(trip_id: str, session: Session = Depends(get_session)):
     if trip.status == "ingesting":
         raise HTTPException(status_code=409, detail="Ingestion already in progress")
 
-    start_ingestion_thread(trip_id)
+    try:
+        start_ingestion_thread(trip_id)
+    except JobRunning as e:
+        raise HTTPException(409, str(e))
     return {"status": "started", "trip_id": trip_id}
 
 
