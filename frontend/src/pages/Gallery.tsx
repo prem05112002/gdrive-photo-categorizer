@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
-import { useParams, useNavigate } from 'react-router-dom'
+import { useParams, useNavigate, useSearchParams } from 'react-router-dom'
 import { ExternalLink, X, ChevronLeft, ChevronRight, Loader2 } from 'lucide-react'
 import { api, type GalleryData, type GalleryPhoto, type GalleryPerson } from '../api/client'
 import { Topbar } from '../components/Topbar'
@@ -53,7 +53,9 @@ export function Gallery() {
   const [pendingCount, setPendingCount] = useState(0)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
-  const [selectedFolder, setSelectedFolder] = useState<FolderKey | null>(null)
+  const [searchParams] = useSearchParams()
+  // ?folder=<person_id | place:label | misc> opens straight onto that folder (Review's Confirmed list links here)
+  const [selectedFolder, setSelectedFolder] = useState<FolderKey | null>(searchParams.get('folder'))
   const [lightbox, setLightbox] = useState<Lightbox | null>(null)
   const [imgDims, setImgDims] = useState<ImgDims | null>(null)
   const [syncing, setSyncing] = useState(false)
@@ -79,9 +81,14 @@ export function Gallery() {
       setOutputFolderId(trip.output_folder_id)
       setGallery(galleryData)
       setPendingCount(syncStatus.pending_count)
-      setSelectedFolder(prev =>
-        prev ?? (galleryData.persons.length > 0 ? galleryData.persons[0].id : 'misc')
-      )
+      setSelectedFolder(prev => {
+        const valid = prev != null && (
+          prev === 'misc'
+          || galleryData.persons.some(p => p.id === prev)
+          || galleryData.places.some(pl => `place:${pl.label}` === prev)
+        )
+        return valid ? prev : (galleryData.persons.length > 0 ? galleryData.persons[0].id : 'misc')
+      })
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Failed to load gallery')
     } finally {

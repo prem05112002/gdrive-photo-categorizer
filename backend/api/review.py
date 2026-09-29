@@ -5,7 +5,7 @@ from sqlalchemy.orm import Session
 
 from database.models import get_session, FaceObservation, Photo, Person, PersonEmbedding, TripPerson
 from database import crud
-from enrollment.cluster import cluster_faces
+from enrollment.cluster import cluster_faces, representatives_payload
 
 router = APIRouter()
 
@@ -149,12 +149,15 @@ def get_misc_clusters(trip_id: str, session: Session = Depends(get_session)):
         raise HTTPException(404, "Trip not found")
 
     clusters = cluster_faces(session, trip_id)
+    reps = representatives_payload(session, clusters)
     result = []
     for c in clusters:
         result.append({
             "cluster_id": c["cluster_id"],
             "size": c["size"],
+            "photo_count": c["photo_count"],
             "face_ids": c["face_ids"],
+            "representatives": reps[c["cluster_id"]],
             "representative_crops": [
                 base64.b64encode(crop).decode() for crop in c["representative_crops"]
             ],

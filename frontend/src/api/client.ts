@@ -159,7 +159,9 @@ export interface MiscResponse {
 export interface MiscCluster {
   cluster_id: number
   size: number
+  photo_count: number
   face_ids: string[]
+  representatives: FaceRep[]      // best first, spread across photos — hero + samples + lightbox
   representative_crops: string[]  // base64 JPEG
 }
 

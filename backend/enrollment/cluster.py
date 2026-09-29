@@ -1,3 +1,5 @@
+import base64
+
 import numpy as np
 from sklearn.cluster import AgglomerativeClustering
 from sqlalchemy.orm import Session
@@ -151,3 +153,31 @@ def count_low_quality(session: Session, trip_id: str) -> int:
         )
         .count()
     )
+
+
+def representatives_payload(session: Session, clusters: list[dict]) -> dict[int, list[dict]]:
+    """
+    JSON-ready sample faces per cluster_id (face_id, photo_id, file_name, bbox,
+    base64 crop) — what the Enroll and Review pages render as hero + samples and
+    open in the face-in-context lightbox. One query for all file names.
+    """
+    photo_ids = {f.photo_id for c in clusters for f in c["representatives"]}
+    file_names: dict[str, str | None] = dict(
+        session.query(Photo.id, Photo.drive_file_name).filter(Photo.id.in_(photo_ids)).all()
+    ) if photo_ids else {}
+    return {
+        c["cluster_id"]: [
+            {
+                "face_id": f.id,
+                "photo_id": f.photo_id,
+                "file_name": file_names.get(f.photo_id),
+                "bbox_x": f.bbox_x,
+                "bbox_y": f.bbox_y,
+                "bbox_w": f.bbox_w,
+                "bbox_h": f.bbox_h,
+                "crop": base64.b64encode(f.face_crop).decode(),
+            }
+            for f in c["representatives"]
+        ]
+        for c in clusters
+    }

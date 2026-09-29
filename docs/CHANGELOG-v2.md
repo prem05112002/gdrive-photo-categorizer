@@ -63,6 +63,15 @@ Full-pipeline speed + accuracy overhaul. Five commits on `v2`:
 
 ---
 
+## 2c. Review page: Misc faces get the Enroll treatment (2026-09-29)
+
+- **Misc clusters** show a 96px hero + 44px samples (spread across photos) instead of three 44px crops; any crop opens the shared **face-in-context lightbox** (`components/FaceLightbox.tsx`, extracted from Enroll) whose action row here is the person chips → `Confirm → Name`, `+ New person`, `Dismiss`. Keyboard: Esc / arrows.
+- `GET /review/{trip}/misc-clusters` now returns `representatives[]` and `photo_count` (shared serializer `enrollment.cluster.representatives_payload`).
+- **Confirmed panel** rows were static divs with the first one styled as selected (design leftover). They are buttons now: each opens the gallery on that person (`/gallery?folder=<person_id>`, Gallery reads the param), Places opens the gallery.
+- **Trip cover fix:** `GET /trips/{id}/cover` served the raw group-photo file labelled `image/jpeg`; once the top group photo was a HEIC the card went blank. Cover and photo thumbnails now share `_thumbnail_jpeg()` (EXIF-upright, real JPEG).
+
+---
+
 ## 3. Clustering (`backend/enrollment/cluster.py`)
 
 **Problem:** DBSCAN with `min_samples=1` has no noise concept — every odd pose/lighting variant became its own singleton cluster (the 314-misc-faces incident).

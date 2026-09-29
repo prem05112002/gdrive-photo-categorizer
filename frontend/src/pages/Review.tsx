@@ -4,8 +4,16 @@ import { useParams, useNavigate } from 'react-router-dom'
 import { ExternalLink, UserX, Loader2, MapPin, ScanSearch } from 'lucide-react'
 import { api, type ClassifyResults, type MiscCluster, type OutfitMatch, type Misclassification } from '../api/client'
 import { Topbar } from '../components/Topbar'
+import { FaceLightbox } from '../components/FaceLightbox'
+import { countLabel } from '../lib/faces'
 
 type Tab = 'misc' | 'outfit' | 'verify'
+
+const sideRowBtn: React.CSSProperties = {
+  display: 'flex', alignItems: 'center', gap: 10, width: '100%',
+  padding: 7, borderRadius: 8, background: 'transparent', border: 'none', cursor: 'pointer',
+  transition: 'background .12s',
+}
 
 export function Review() {
   const { id } = useParams<{ id: string }>()
@@ -240,14 +248,14 @@ export function Review() {
           </div>
 
           <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-            {results.persons.map((p, idx) => (
-              <div
+            {results.persons.map(p => (
+              <button
                 key={p.person_id}
-                style={{
-                  display: 'flex', alignItems: 'center', gap: 10,
-                  padding: 7, borderRadius: 8,
-                  background: idx === 0 ? 'var(--surface)' : 'transparent',
-                }}
+                onClick={() => navigate(`/trips/${id}/gallery?folder=${p.person_id}`)}
+                title={`Open ${p.name}'s photos in the gallery`}
+                style={sideRowBtn}
+                onMouseEnter={e => { e.currentTarget.style.background = 'var(--surface)' }}
+                onMouseLeave={e => { e.currentTarget.style.background = 'transparent' }}
               >
                 <img
                   src={`/api/persons/${p.person_id}/thumbnail`}
@@ -255,24 +263,33 @@ export function Review() {
                   style={{ width: 30, height: 30, borderRadius: '50%', objectFit: 'cover', flexShrink: 0, background: 'var(--surface)' }}
                   onError={e => { (e.target as HTMLImageElement).style.visibility = 'hidden' }}
                 />
-                <span style={{ flex: 1, fontSize: 13, fontWeight: 600, color: 'var(--text-primary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                <span style={{ flex: 1, minWidth: 0, fontSize: 13, fontWeight: 600, color: 'var(--text-primary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', textAlign: 'left' }}>
                   {p.name}
                 </span>
                 <span style={{ fontSize: 11, fontWeight: 500, color: '#71717A', flexShrink: 0 }}>{p.photo_count}</span>
-              </div>
+              </button>
             ))}
           </div>
+          <p style={{ fontSize: 11, color: '#52525b', margin: '10px 0 0', lineHeight: 1.4 }}>
+            Photo counts so far. Click a name to see their photos in the gallery.
+          </p>
 
           {totalScenePhotos > 0 && (
             <>
               <div style={{ height: 1, background: 'var(--border)', margin: '14px 0' }} />
-              <div style={{ display: 'flex', alignItems: 'center', gap: 10, padding: 7 }}>
+              <button
+                onClick={() => navigate(`/trips/${id}/gallery`)}
+                title="Open the gallery"
+                style={sideRowBtn}
+                onMouseEnter={e => { e.currentTarget.style.background = 'var(--surface)' }}
+                onMouseLeave={e => { e.currentTarget.style.background = 'transparent' }}
+              >
                 <div style={{ width: 30, height: 30, borderRadius: 8, background: 'var(--surface)', border: '1px solid var(--border)', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
                   <MapPin size={14} style={{ color: 'var(--text-muted)' }} />
                 </div>
-                <span style={{ flex: 1, fontSize: 13, fontWeight: 600, color: 'var(--text-primary)' }}>Places</span>
+                <span style={{ flex: 1, fontSize: 13, fontWeight: 600, color: 'var(--text-primary)', textAlign: 'left' }}>Places</span>
                 <span style={{ fontSize: 11, fontWeight: 500, color: '#71717A' }}>{totalScenePhotos}</span>
-              </div>
+              </button>
             </>
           )}
         </div>
@@ -773,6 +790,22 @@ function MiscClusterList({
   onDismiss: (clusterId: number, faceIds: string[]) => void
   onDismissAllSingletons: () => void
 }) {
+  const [lightbox, setLightbox] = useState<{ cluster: MiscCluster; index: number } | null>(null)
+
+  // Esc closes the face-in-context view, arrows flip through its samples
+  useEffect(() => {
+    if (!lightbox) return
+    function onKey(e: KeyboardEvent) {
+      if (e.key === 'Escape') { setLightbox(null); return }
+      if ((e.target as HTMLElement | null)?.tagName === 'INPUT') return
+      const last = lightbox!.cluster.representatives.length - 1
+      if (e.key === 'ArrowLeft')  setLightbox(lb => lb && { ...lb, index: Math.max(0, lb.index - 1) })
+      if (e.key === 'ArrowRight') setLightbox(lb => lb && { ...lb, index: Math.min(last, lb.index + 1) })
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [lightbox])
+
   if (totalFaces === 0) {
     return (
       <div style={{ paddingTop: 64, textAlign: 'center' }}>
@@ -783,6 +816,7 @@ function MiscClusterList({
 
   const repeated   = clusters.filter(c => c.size >= 2)
   const singletons = clusters.filter(c => c.size === 1)
+  const lb = lightbox && clusters.some(c => c.cluster_id === lightbox.cluster.cluster_id) ? lightbox : null
 
   return (
     <div>
@@ -790,7 +824,27 @@ function MiscClusterList({
         <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--text-muted)' }}>
           {clusters.length} cluster{clusters.length !== 1 ? 's' : ''} · {totalFaces} faces
         </span>
+        <span style={{ fontSize: 12, color: '#71717A' }}>click any face to see it in its photo before assigning</span>
       </div>
+
+      {lb && (
+        <FaceLightbox
+          cluster={lb.cluster}
+          index={lb.index}
+          title="Unassigned"
+          onIndex={index => setLightbox({ cluster: lb.cluster, index })}
+          onClose={() => setLightbox(null)}
+        >
+          <MiscAssignRow
+            key={lb.cluster.cluster_id}
+            persons={persons}
+            acting={clusterActing.has(lb.cluster.cluster_id)}
+            onAssign={pid => { onAssign(lb.cluster.cluster_id, lb.cluster.face_ids, pid); setLightbox(null) }}
+            onCreate={name => { onCreate(lb.cluster.cluster_id, lb.cluster.face_ids, name); setLightbox(null) }}
+            onDismiss={() => { onDismiss(lb.cluster.cluster_id, lb.cluster.face_ids); setLightbox(null) }}
+          />
+        </FaceLightbox>
+      )}
 
       {repeated.length > 0 && (
         <div style={{ marginBottom: 24 }}>
@@ -807,6 +861,7 @@ function MiscClusterList({
                 onAssign={(pid) => onAssign(c.cluster_id, c.face_ids, pid)}
                 onCreate={(name) => onCreate(c.cluster_id, c.face_ids, name)}
                 onDismiss={() => onDismiss(c.cluster_id, c.face_ids)}
+                onOpen={index => setLightbox({ cluster: c, index })}
               />
             ))}
           </div>
@@ -836,6 +891,7 @@ function MiscClusterList({
                 onAssign={(pid) => onAssign(c.cluster_id, c.face_ids, pid)}
                 onCreate={(name) => onCreate(c.cluster_id, c.face_ids, name)}
                 onDismiss={() => onDismiss(c.cluster_id, c.face_ids)}
+                onOpen={() => setLightbox({ cluster: c, index: 0 })}
               />
             ))}
           </div>
@@ -845,41 +901,53 @@ function MiscClusterList({
   )
 }
 
-function MiscClusterRow({ cluster, persons, acting, onAssign, onCreate, onDismiss }: {
+function MiscClusterRow({ cluster, persons, acting, onAssign, onCreate, onDismiss, onOpen }: {
   cluster: MiscCluster
   persons: { name: string; person_id: string; photo_count: number }[]
   acting: boolean
   onAssign: (personId: string) => void
   onCreate: (name: string) => void
   onDismiss: () => void
+  onOpen: (index: number) => void
 }) {
   const [mode, setMode] = useState<'idle' | 'pick' | 'new'>('idle')
   const [pickedId, setPickedId] = useState('')
   const [newName, setNewName] = useState('')
+  const hero = cluster.representatives[0]
+  const samples = cluster.representatives.slice(1)
 
   function reset() { setMode('idle'); setPickedId(''); setNewName('') }
 
   return (
     <div style={{ background: 'var(--surface)', border: '1px solid var(--border)', borderRadius: 12, padding: '12px 14px' }}>
-      {/* Top row: crops + count + action buttons */}
+      {/* Top row: hero + samples (click → face in its photo), count, action buttons */}
       <div style={{ display: 'flex', alignItems: 'center', gap: 14 }}>
-        {/* Overlapping crops */}
-        <div style={{ display: 'flex', flexShrink: 0 }}>
-          {cluster.representative_crops.slice(0, 3).map((crop, i) => (
+        {hero && (
+          <img
+            src={`data:image/jpeg;base64,${hero.crop}`}
+            onClick={() => onOpen(0)}
+            title="See this face in its photo"
+            alt=""
+            style={{ width: 96, height: 96, borderRadius: 12, objectFit: 'cover', flexShrink: 0, cursor: 'zoom-in', background: 'var(--surface-2)' }}
+          />
+        )}
+        <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+          {samples.map((rep, i) => (
             <img
-              key={i}
-              src={`data:image/jpeg;base64,${crop}`}
-              style={{ width: 44, height: 44, borderRadius: 10, objectFit: 'cover', border: '2px solid var(--surface)', marginLeft: i > 0 ? -12 : 0 }}
+              key={rep.face_id}
+              src={`data:image/jpeg;base64,${rep.crop}`}
+              onClick={() => onOpen(i + 1)}
+              title="See this face in its photo"
               alt=""
+              style={{ width: 44, height: 44, borderRadius: 8, objectFit: 'cover', cursor: 'zoom-in', background: 'var(--surface-2)' }}
             />
           ))}
         </div>
 
-        <span style={{ fontSize: 12, fontWeight: 500, color: '#71717A', width: 90, flexShrink: 0 }}>
-          {cluster.size} appearances
-        </span>
-
-        <div style={{ flex: 1 }} />
+        <div style={{ marginLeft: 'auto', textAlign: 'right', flexShrink: 0 }}>
+          <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--text-primary)' }}>{countLabel(cluster)}</div>
+          <div style={{ fontSize: 11, color: '#71717A' }}>unassigned</div>
+        </div>
 
         {mode === 'idle' && (
           <div style={{ display: 'flex', gap: 8 }}>
@@ -978,26 +1046,33 @@ function MiscClusterRow({ cluster, persons, acting, onAssign, onCreate, onDismis
   )
 }
 
-function MiscSingletonCard({ cluster, persons, acting, onAssign, onCreate, onDismiss }: {
+function MiscSingletonCard({ cluster, persons, acting, onAssign, onCreate, onDismiss, onOpen }: {
   cluster: MiscCluster
   persons: { name: string; person_id: string; photo_count: number }[]
   acting: boolean
   onAssign: (personId: string) => void
   onCreate: (name: string) => void
   onDismiss: () => void
+  onOpen: () => void
 }) {
   const [expanded, setExpanded] = useState(false)
   const [pickedId, setPickedId] = useState('')
   const [newName, setNewName] = useState('')
   const [mode, setMode] = useState<'pick' | 'new'>('pick')
 
-  const crop = cluster.representative_crops[0]
+  const crop = cluster.representatives[0]?.crop ?? cluster.representative_crops[0]
 
   if (!expanded) {
     return (
       <div style={{ background: 'var(--surface)', border: '1px solid var(--border)', borderRadius: 10, padding: 8, textAlign: 'center' }}>
         {crop ? (
-          <img src={`data:image/jpeg;base64,${crop}`} style={{ width: '100%', aspectRatio: '1', objectFit: 'cover', borderRadius: 7, marginBottom: 6, display: 'block' }} alt="" />
+          <img
+            src={`data:image/jpeg;base64,${crop}`}
+            onClick={onOpen}
+            title="See this face in its photo"
+            style={{ width: '100%', aspectRatio: '1', objectFit: 'cover', borderRadius: 7, marginBottom: 6, display: 'block', cursor: 'zoom-in' }}
+            alt=""
+          />
         ) : (
           <div style={{ width: '100%', aspectRatio: '1', background: 'var(--surface-2)', borderRadius: 7, marginBottom: 6 }} />
         )}
@@ -1072,6 +1147,93 @@ function MiscSingletonCard({ cluster, persons, acting, onAssign, onCreate, onDis
           </button>
         </div>
       )}
+    </div>
+  )
+}
+
+// ── Lightbox action row: assign the cluster from the context view ──────────────
+
+function MiscAssignRow({ persons, acting, onAssign, onCreate, onDismiss }: {
+  persons: { name: string; person_id: string; photo_count: number }[]
+  acting: boolean
+  onAssign: (personId: string) => void
+  onCreate: (name: string) => void
+  onDismiss: () => void
+}) {
+  const [mode, setMode] = useState<'pick' | 'new'>('pick')
+  const [pickedId, setPickedId] = useState('')
+  const [newName, setNewName] = useState('')
+  const picked = persons.find(p => p.person_id === pickedId)
+
+  if (mode === 'new') {
+    return (
+      <div style={{ marginLeft: 'auto', display: 'flex', gap: 8, flex: '1 1 300px', justifyContent: 'flex-end' }}>
+        <input
+          autoFocus
+          value={newName}
+          onChange={e => setNewName(e.target.value)}
+          onKeyDown={e => { if (e.key === 'Enter' && newName.trim() && !acting) onCreate(newName.trim()) }}
+          placeholder="New person name…"
+          style={{ flex: '1 1 160px', maxWidth: 320, height: 36, border: '1px solid var(--border)', borderRadius: 8, background: 'var(--bg)', color: 'var(--text-primary)', padding: '0 12px', fontSize: 13, outline: 'none' }}
+          onFocus={e => (e.currentTarget.style.borderColor = 'var(--accent)')}
+          onBlur={e => (e.currentTarget.style.borderColor = 'var(--border)')}
+        />
+        <button
+          onClick={() => newName.trim() && !acting && onCreate(newName.trim())}
+          disabled={!newName.trim() || acting}
+          style={{ background: 'var(--accent)', color: '#fff', border: 'none', borderRadius: 8, padding: '0 16px', fontSize: 13, fontWeight: 600, cursor: 'pointer', opacity: !newName.trim() || acting ? 0.4 : 1 }}
+        >
+          Create
+        </button>
+        <button onClick={() => setMode('pick')} style={{ fontSize: 13, color: '#71717A', background: 'transparent', border: '1px solid var(--border)', borderRadius: 8, padding: '0 12px', cursor: 'pointer' }}>
+          Back
+        </button>
+      </div>
+    )
+  }
+
+  return (
+    <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', justifyContent: 'flex-end', flex: '1 1 320px' }}>
+      {persons.map(p => {
+        const isSel = p.person_id === pickedId
+        return (
+          <button
+            key={p.person_id}
+            onClick={() => setPickedId(isSel ? '' : p.person_id)}
+            style={{
+              display: 'inline-flex', alignItems: 'center', gap: 7,
+              background: isSel ? 'rgba(124,110,248,.16)' : 'var(--bg)',
+              border: `1px solid ${isSel ? '#7C6EF8' : 'var(--border)'}`,
+              borderRadius: 30, padding: '4px 12px 4px 4px', cursor: 'pointer',
+            }}
+          >
+            <img src={`/api/persons/${p.person_id}/thumbnail`} alt={p.name}
+              style={{ width: 24, height: 24, borderRadius: '50%', objectFit: 'cover', background: 'var(--border)' }}
+              onError={e => { (e.target as HTMLImageElement).style.display = 'none' }} />
+            <span style={{ fontSize: 12, fontWeight: 600, color: 'var(--text-primary)' }}>{p.name}</span>
+          </button>
+        )
+      })}
+      <button
+        onClick={() => setMode('new')}
+        style={{ display: 'inline-flex', alignItems: 'center', border: '1px dashed #3f3f46', borderRadius: 30, padding: '6px 12px', background: 'transparent', color: '#a1a1aa', fontSize: 12, fontWeight: 600, cursor: 'pointer' }}
+      >
+        + New person
+      </button>
+      <button
+        onClick={() => pickedId && !acting && onAssign(pickedId)}
+        disabled={!pickedId || acting}
+        style={{ background: 'var(--accent)', color: '#fff', border: 'none', borderRadius: 8, padding: '8px 16px', fontSize: 13, fontWeight: 600, cursor: pickedId ? 'pointer' : 'not-allowed', opacity: !pickedId || acting ? 0.4 : 1 }}
+      >
+        {acting ? '…' : picked ? `Confirm → ${picked.name}` : 'Confirm'}
+      </button>
+      <button
+        onClick={onDismiss}
+        disabled={acting}
+        style={{ fontSize: 12, fontWeight: 600, background: 'transparent', color: '#71717A', border: '1px solid var(--border)', borderRadius: 8, padding: '8px 12px', cursor: 'pointer' }}
+      >
+        Dismiss
+      </button>
     </div>
   )
 }

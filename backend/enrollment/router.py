@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 
 from database.models import get_session, FaceObservation, Photo, Person, PersonEmbedding, TripPerson
 from database import crud
-from enrollment.cluster import cluster_faces, count_low_quality
+from enrollment.cluster import cluster_faces, count_low_quality, representatives_payload
 from pipeline.face import MAX_LONG_SIDE
 
 from database.models import PersonOutfit, UnmatchedPerson
@@ -125,11 +125,7 @@ def get_clusters(trip_id: str, session: Session = Depends(get_session)):
         .scalar()
     ) or 0
 
-    # One query for the file names behind every sample face
-    rep_photo_ids = {f.photo_id for c in clusters for f in c["representatives"]}
-    file_names: dict[str, str | None] = dict(
-        session.query(Photo.id, Photo.drive_file_name).filter(Photo.id.in_(rep_photo_ids)).all()
-    ) if rep_photo_ids else {}
+    reps = representatives_payload(session, clusters)
 
     return {
         "clusters": [
@@ -139,19 +135,7 @@ def get_clusters(trip_id: str, session: Session = Depends(get_session)):
                 "photo_count": c["photo_count"],
                 "is_singleton": c["is_singleton"],
                 "face_ids": c["face_ids"],
-                "representatives": [
-                    {
-                        "face_id": f.id,
-                        "photo_id": f.photo_id,
-                        "file_name": file_names.get(f.photo_id),
-                        "bbox_x": f.bbox_x,
-                        "bbox_y": f.bbox_y,
-                        "bbox_w": f.bbox_w,
-                        "bbox_h": f.bbox_h,
-                        "crop": base64.b64encode(f.face_crop).decode(),
-                    }
-                    for f in c["representatives"]
-                ],
+                "representatives": reps[c["cluster_id"]],
                 "suggested_cluster_id": c["suggested_cluster_id"],
             }
             for c in clusters
