@@ -21,6 +21,23 @@ photos_router = APIRouter()
 _TEMP = Path(__file__).parent.parent / "temp"
 
 
+def _thumbnail_jpeg(path: Path, w: int, quality: int = 75) -> bytes:
+    """
+    JPEG bytes of any supported image (JPEG/PNG/HEIC), EXIF-upright, longest
+    side ≤ w. Browsers can't decode HEIC, so anything served as an <img> for a
+    card or grid goes through here rather than FileResponse of the original.
+    """
+    import pillow_heif
+    from PIL import Image, ImageOps
+    pillow_heif.register_heif_opener()
+    with Image.open(path) as img:
+        img = ImageOps.exif_transpose(img)
+        img.thumbnail((w, w), Image.LANCZOS)
+        buf = io.BytesIO()
+        img.convert("RGB").save(buf, format="JPEG", quality=quality, optimize=True)
+    return buf.getvalue()
+
+
 # ── Trip gallery ───────────────────────────────────────────────────────────────
 
 @trips_router.get("/{trip_id}/gallery")
@@ -159,7 +176,14 @@ def get_cover(trip_id: str, session: Session = Depends(get_session)):
     if not path.exists():
         raise HTTPException(404, "Cover photo file not on disk")
 
-    return FileResponse(str(path), media_type="image/jpeg")
+    # Always a real JPEG: the cover is often a HEIC group photo, and the raw
+    # file labelled image/jpeg rendered as a blank card.
+    try:
+        data = _thumbnail_jpeg(path, 1200, quality=80)
+    except Exception as e:
+        raise HTTPException(500, f"Cover generation failed: {e}")
+    return Response(content=data, media_type="image/jpeg",
+                    headers={"Cache-Control": "public, max-age=3600"})
 
 
 # ── Photo serving ──────────────────────────────────────────────────────────────
@@ -211,10 +235,6 @@ def get_photo_thumbnail(
     session: Session = Depends(get_session),
 ):
     """Resized JPEG thumbnail for grid display. w= sets max dimension (default 480px)."""
-    import pillow_heif
-    from PIL import Image, ExifTags
-    pillow_heif.register_heif_opener()
-
     photo = session.query(Photo).filter(Photo.id == photo_id, Photo.trip_id == trip_id).first()
     if not photo:
         raise HTTPException(404, "Photo not found")
@@ -227,28 +247,11 @@ def get_photo_thumbnail(
         raise HTTPException(404, detail={"cache_cleared": True, "message": "Photo not on disk"})
 
     try:
-        with Image.open(path) as img:
-            # Respect EXIF orientation
-            try:
-                exif = img._getexif()
-                if exif:
-                    orientation_key = next(
-                        k for k, v in ExifTags.TAGS.items() if v == "Orientation"
-                    )
-                    orientation = exif.get(orientation_key)
-                    _ROT = {3: 180, 6: 270, 8: 90}
-                    if orientation in _ROT:
-                        img = img.rotate(_ROT[orientation], expand=True)
-            except Exception:
-                pass
-
-            img.thumbnail((w, w), Image.LANCZOS)
-            buf = io.BytesIO()
-            img.convert("RGB").save(buf, format="JPEG", quality=75, optimize=True)
-            return Response(content=buf.getvalue(), media_type="image/jpeg",
-                            headers={"Cache-Control": "public, max-age=86400"})
+        data = _thumbnail_jpeg(path, w)
     except Exception as e:
         raise HTTPException(500, f"Thumbnail generation failed: {e}")
+    return Response(content=data, media_type="image/jpeg",
+                    headers={"Cache-Control": "public, max-age=86400"})
 
 
 class SceneLabelPayload(BaseModel):
