@@ -4,6 +4,7 @@ import numpy as np
 from sklearn.cluster import AgglomerativeClustering
 from sqlalchemy.orm import Session
 
+from database import crud
 from database.models import FaceObservation, Photo
 
 # Two-stage clustering on L2-normalized 512-dim ArcFace embeddings.
@@ -35,9 +36,8 @@ def cluster_faces(session: Session, trip_id: str) -> list[dict]:
         .filter(
             Photo.trip_id == trip_id,
             FaceObservation.raw_embedding.isnot(None),
-            FaceObservation.is_stranger == False,
-            FaceObservation.person_id.is_(None),
-            FaceObservation.is_low_quality == False,  # quality gate — junk never reaches review
+            # unassigned, not dismissed, passes the quality gate — junk never reaches review
+            crud.routable_unmatched_face_filter(),
         )
         .all()
     )

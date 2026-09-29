@@ -78,6 +78,77 @@ def _get_or_create_folder(service, name: str, parent_id: str) -> tuple[str, bool
     return create_folder(service, name, parent_id), True
 
 
+# ── Output planner ──────────────────────────────────────────────────────────────
+
+def plan_trip_output(session, trip_id: str) -> list[dict]:
+    """
+    Decide, from the DB alone, which Drive folder(s) every photo of the trip
+    belongs in. One item per shortcut to create:
+
+        {"photo_id", "file_id", "name", "folder": tuple[str, ...], "pid"}
+
+    ``folder`` is a path under [Organized] — ("RAW",), ("Places", label),
+    (person_name,) or ("Misc",); ``pid`` is set for person folders so the
+    shortcut id can be recorded on that person's face rows.
+
+    The routing rules live in database.crud (misc_photo_filter and friends) and
+    are shared with the classify results and the gallery, so the Drive tree
+    always matches what the UI shows. No Drive calls — safe to dry-run.
+    """
+    photos = session.query(Photo).filter(Photo.trip_id == trip_id).all()
+
+    persons: dict[str, Person] = {
+        tp.person_id: person
+        for tp, person in (
+            session.query(TripPerson, Person)
+            .join(Person, Person.id == TripPerson.person_id)
+            .filter(TripPerson.trip_id == trip_id)
+        )
+    }
+
+    misc_ids = {pid for (pid,) in session.query(Photo.id).filter(crud.misc_photo_filter(trip_id))}
+    places_ids = {pid for (pid,) in session.query(Photo.id).filter(crud.places_photo_filter(trip_id))}
+
+    named_by_photo: dict[str, set[str]] = {}
+    named_rows = (
+        session.query(FaceObservation.photo_id, FaceObservation.person_id)
+        .join(Photo, Photo.id == FaceObservation.photo_id)
+        .filter(Photo.trip_id == trip_id, FaceObservation.person_id.isnot(None))
+        .distinct()
+    )
+    for photo_id, pid in named_rows:
+        named_by_photo.setdefault(photo_id, set()).add(pid)
+
+    plan: list[dict] = []
+
+    def add(photo: Photo, folder: tuple[str, ...], pid: str | None = None) -> None:
+        plan.append({
+            "photo_id": photo.id,
+            "file_id": photo.drive_file_id,
+            "name": photo.drive_file_name or f"file_{photo.id}",
+            "folder": folder,
+            "pid": pid,
+        })
+
+    for photo in photos:
+        if photo.is_video or photo.is_duplicate:
+            continue
+        if photo.is_raw:
+            add(photo, ("RAW",))
+            continue
+        if photo.id in places_ids:
+            # no faces, or only low-quality / dismissed ones — file by scene
+            add(photo, ("Places", photo.scene_label or "other"))
+            continue
+        for pid in sorted(named_by_photo.get(photo.id, ())):
+            if pid in persons:
+                add(photo, (persons[pid].name,), pid)
+        if photo.id in misc_ids:
+            add(photo, ("Misc",))
+
+    return plan
+
+
 # ── Output builder ──────────────────────────────────────────────────────────────
 
 def build_trip_output(
@@ -87,80 +158,30 @@ def build_trip_output(
     progress_callback: Callable[[int, int, str], None] | None = None,
 ) -> tuple[int, str]:
     """
-    Create [Organized] subfolder inside the source Drive folder and populate it
-    with per-person shortcuts, Places/{label}/ shortcuts, RAW shortcuts, and
-    Misc shortcuts for photos with unmatched faces.
+    Create [Organized] inside the source Drive folder and populate it with the
+    shortcuts plan_trip_output() asks for: per-person folders, Places/{label}/,
+    RAW/ and Misc/.
 
-    Plans the full shortcut worklist from the DB first, then creates shortcuts
-    in parallel. Existence checks (1 extra API call per shortcut) only run when
-    the [Organized] folder already existed — a fresh output tree can't have
-    collisions.
+    Folders are created lazily (only the ones the plan needs), then shortcuts
+    are created in parallel. Existence checks (1 extra API call per shortcut)
+    only run when [Organized] already existed — a fresh tree can't collide.
 
     Returns (shortcuts_created, root_folder_id).
     """
     trip = session.query(Trip).filter(Trip.id == trip_id).first()
-    photos = session.query(Photo).filter(Photo.trip_id == trip_id).all()
-
-    trip_persons = session.query(TripPerson).filter(TripPerson.trip_id == trip_id).all()
-    persons: dict[str, Person] = {}
-    for tp in trip_persons:
-        p = session.query(Person).filter(Person.id == tp.person_id).first()
-        if p:
-            persons[tp.person_id] = p
+    plan = plan_trip_output(session, trip_id)
 
     root_id, root_created = _get_or_create_folder(service, "[Organized]", trip.drive_folder_id)
     safe_mode = not root_created  # re-run into an existing tree → dedupe checks needed
 
-    # ── Plan: folders needed + one worklist item per shortcut ──────────────
-    person_folders: dict[str, str] = {
-        pid: get_or_create_folder(service, person.name, root_id)
-        for pid, person in persons.items()
-    }
+    folder_ids: dict[tuple[str, ...], str] = {(): root_id}
 
-    places_id: str | None = None
-    place_sub: dict[str, str] = {}
-    misc_id: str | None = None
-    raw_id: str | None = None
+    def folder_for(path: tuple[str, ...]) -> str:
+        if path not in folder_ids:
+            folder_ids[path] = get_or_create_folder(service, path[-1], folder_for(path[:-1]))
+        return folder_ids[path]
 
-    worklist: list[dict] = []  # {file_id, name, parent_id, pid?, photo_id}
-
-    for photo in photos:
-        fname = photo.drive_file_name or f"file_{photo.id}"
-
-        if photo.is_video or photo.is_duplicate:
-            continue
-
-        if photo.is_raw:
-            if raw_id is None:
-                raw_id = get_or_create_folder(service, "RAW", root_id)
-            worklist.append({"file_id": photo.drive_file_id, "name": fname,
-                             "parent_id": raw_id, "pid": None, "photo_id": photo.id})
-            continue
-
-        if photo.face_count == 0:
-            label = photo.scene_label or "other"
-            if places_id is None:
-                places_id = get_or_create_folder(service, "Places", root_id)
-            if label not in place_sub:
-                place_sub[label] = get_or_create_folder(service, label, places_id)
-            worklist.append({"file_id": photo.drive_file_id, "name": fname,
-                             "parent_id": place_sub[label], "pid": None, "photo_id": photo.id})
-            continue
-
-        faces = session.query(FaceObservation).filter(FaceObservation.photo_id == photo.id).all()
-        named_pids = {f.person_id for f in faces if f.person_id}
-        has_unmatched = any(not f.person_id and not f.is_stranger for f in faces)
-
-        for pid in named_pids:
-            if pid in person_folders:
-                worklist.append({"file_id": photo.drive_file_id, "name": fname,
-                                 "parent_id": person_folders[pid], "pid": pid, "photo_id": photo.id})
-
-        if has_unmatched:
-            if misc_id is None:
-                misc_id = get_or_create_folder(service, "Misc", root_id)
-            worklist.append({"file_id": photo.drive_file_id, "name": fname,
-                             "parent_id": misc_id, "pid": None, "photo_id": photo.id})
+    worklist = [{**item, "parent_id": folder_for(item["folder"])} for item in plan]
 
     # ── Execute: parallel shortcut creation ────────────────────────────────
     total = len(worklist)

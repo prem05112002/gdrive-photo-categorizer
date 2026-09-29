@@ -90,22 +90,17 @@ def get_gallery(trip_id: str, session: Session = Depends(get_session)):
 
     persons_out.sort(key=lambda p: p["photo_count"], reverse=True)
 
-    # Places: no-face photos grouped by scene label
-    no_face_photos = (
+    # Places: photos with no routable face — no faces, or only low-quality /
+    # dismissed ones — grouped by scene label (crud.places_photo_filter)
+    place_photos = (
         session.query(Photo)
-        .filter(
-            Photo.trip_id == trip_id,
-            Photo.face_count == 0,
-            Photo.is_raw == False,
-            Photo.is_video == False,
-            Photo.is_duplicate == False,
-        )
+        .filter(crud.places_photo_filter(trip_id))
         .order_by(Photo.exif_timestamp)
         .all()
     )
 
     places_dict: dict[str, list] = {}
-    for p in no_face_photos:
+    for p in place_photos:
         label = p.scene_label or "other"
         places_dict.setdefault(label, []).append({
             "id": p.id,
@@ -115,37 +110,33 @@ def get_gallery(trip_id: str, session: Session = Depends(get_session)):
 
     places_out = [{"label": label, "photos": photos} for label, photos in places_dict.items()]
 
-    # Misc: photos with unmatched, non-stranger faces
+    # Misc: photos with at least one unmatched face a human can still review —
+    # unassigned, not dismissed, not low-quality (crud.misc_photo_filter)
     misc_photos = (
         session.query(Photo)
-        .join(FaceObservation, FaceObservation.photo_id == Photo.id)
-        .filter(
-            Photo.trip_id == trip_id,
-            FaceObservation.person_id.is_(None),
-            FaceObservation.is_stranger == False,
-        )
-        .distinct()
+        .filter(crud.misc_photo_filter(trip_id))
         .order_by(Photo.exif_timestamp)
         .all()
     )
 
-    misc_out = []
-    for p in misc_photos:
-        unmatched_faces = (
-            session.query(FaceObservation)
-            .filter(
-                FaceObservation.photo_id == p.id,
-                FaceObservation.person_id.is_(None),
-                FaceObservation.is_stranger == False,
-            )
-            .all()
-        )
-        misc_out.append({
+    face_ids_by_photo: dict[str, list[str]] = {}
+    unmatched_rows = (
+        session.query(FaceObservation.id, FaceObservation.photo_id)
+        .join(Photo, Photo.id == FaceObservation.photo_id)
+        .filter(Photo.trip_id == trip_id, crud.routable_unmatched_face_filter())
+    )
+    for face_id, photo_id in unmatched_rows:
+        face_ids_by_photo.setdefault(photo_id, []).append(face_id)
+
+    misc_out = [
+        {
             "photo_id": p.id,
             "filename": p.drive_file_name,
             "date": p.exif_timestamp.date().isoformat() if p.exif_timestamp else None,
-            "face_ids": [f.id for f in unmatched_faces],
-        })
+            "face_ids": face_ids_by_photo.get(p.id, []),
+        }
+        for p in misc_photos
+    ]
 
     return {"persons": persons_out, "places": places_out, "misc": misc_out}
 

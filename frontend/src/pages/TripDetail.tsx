@@ -307,28 +307,37 @@ export function TripDetail() {
 
           {/* Step 4 — Classify & Upload */}
           <Step num={4} title="Classify & Upload" done={pastClassify} active={classifying} locked={!pastEnrollment}>
-            {classifyProgress && !pastClassify && <ClassifyProgressBar progress={classifyProgress} />}
+            {classifyProgress && (classifying || !pastClassify) && <ClassifyProgressBar progress={classifyProgress} />}
             {pastEnrollment && !pastClassify && !classifying && (
               <button onClick={startClassify} className="btn-primary">
                 <Sparkles size={14} /> Run Classification
               </button>
             )}
             {classifying && <Spinner label="Classifying…" />}
-            {pastClassify && classifyResults && (
-              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
-                {classifyResults.persons.slice(0, 6).map(p => (
-                  <span
-                    key={p.person_id}
-                    style={{ fontSize: 12, padding: '2px 8px', borderRadius: 6, background: 'var(--surface-2)', color: 'var(--text-muted)' }}
-                  >
-                    {p.name} · {p.photo_count}
-                  </span>
-                ))}
-                {classifyResults.persons.length > 6 && (
-                  <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>
-                    +{classifyResults.persons.length - 6} more
-                  </span>
-                )}
+            {pastClassify && !classifying && classifyResults && (
+              <div style={{ display: 'flex', alignItems: 'center', gap: 16, flexWrap: 'wrap' }}>
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, flex: 1, minWidth: 0 }}>
+                  {classifyResults.persons.slice(0, 6).map(p => (
+                    <span
+                      key={p.person_id}
+                      style={{ fontSize: 12, padding: '2px 8px', borderRadius: 6, background: 'var(--surface-2)', color: 'var(--text-muted)' }}
+                    >
+                      {p.name} · {p.photo_count}
+                    </span>
+                  ))}
+                  {classifyResults.persons.length > 6 && (
+                    <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>
+                      +{classifyResults.persons.length - 6} more
+                    </span>
+                  )}
+                </div>
+                <button
+                  onClick={startClassify}
+                  style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 12, color: 'var(--text-muted)', background: 'none', border: 'none', cursor: 'pointer', flexShrink: 0 }}
+                  title="Re-run after enrolling more people — matches unassigned faces and labels photos without a scene yet (idempotent)"
+                >
+                  <RefreshCw size={11} /> Re-run
+                </button>
               </div>
             )}
           </Step>

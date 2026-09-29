@@ -1,13 +1,23 @@
 import { useState, useEffect } from 'react'
 import { flushSync } from 'react-dom'
 import { useParams, useNavigate } from 'react-router-dom'
-import { ExternalLink, UserX, Loader2, MapPin, ScanSearch } from 'lucide-react'
+import { ExternalLink, UserX, Loader2, MapPin, ScanSearch, ChevronDown } from 'lucide-react'
 import { api, type ClassifyResults, type MiscCluster, type OutfitMatch, type Misclassification } from '../api/client'
 import { Topbar } from '../components/Topbar'
 import { FaceLightbox } from '../components/FaceLightbox'
 import { countLabel } from '../lib/faces'
 
 type Tab = 'misc' | 'outfit' | 'verify'
+
+// Unassigned clusters seen in fewer photos than this are bystanders — someone who
+// walked through one or two frames. They collapse into a single section with one
+// Dismiss-all instead of sixty cards to click through. Same cutoff as
+// is_singleton in backend/enrollment/cluster.py.
+const MIN_REVIEW_APPEARANCES = 3
+
+const sectionLabel: React.CSSProperties = {
+  fontSize: 12, fontWeight: 600, color: '#71717A', textTransform: 'uppercase', letterSpacing: '0.06em',
+}
 
 const sideRowBtn: React.CSSProperties = {
   display: 'flex', alignItems: 'center', gap: 10, width: '100%',
@@ -25,6 +35,7 @@ export function Review() {
   const [miscClusters, setMiscClusters]     = useState<MiscCluster[]>([])
   const [miscFacesCount, setMiscFacesCount] = useState(0)
   const [clusterActing, setClusterActing]   = useState<Set<number>>(new Set())
+  const [bulkActing, setBulkActing]         = useState(false)   // Dismiss-all-bystanders in flight
   const [loading, setLoading]               = useState(true)
   const [error, setError]                   = useState<string | null>(null)
   const [activeTab, setActiveTab]           = useState<Tab>('misc')
@@ -112,19 +123,24 @@ export function Review() {
     try {
       await api.review.bulkDismiss(id, faceIds)
       await reloadMiscClusters()
+      setResults(await api.classify.results(id))   // photos with nobody left to name move to Places
     } catch { /* ignore */ } finally {
       setClusterActing(s => { const n = new Set(s); n.delete(clusterId); return n })
     }
   }
 
-  async function dismissAllSingletons() {
+  async function dismissAllBystanders() {
     if (!id) return
-    const faceIds = miscClusters.filter(c => c.size === 1).flatMap(c => c.face_ids)
+    const faceIds = miscClusters.filter(c => c.size < MIN_REVIEW_APPEARANCES).flatMap(c => c.face_ids)
     if (!faceIds.length) return
+    setBulkActing(true)
     try {
       await api.review.bulkDismiss(id, faceIds)
       await reloadMiscClusters()
-    } catch { /* ignore */ }
+      setResults(await api.classify.results(id))
+    } catch { /* ignore */ } finally {
+      setBulkActing(false)
+    }
   }
 
   async function confirmOutfitMatch(umId: string, personId?: string) {
@@ -311,10 +327,11 @@ export function Review() {
               totalFaces={miscFacesCount}
               persons={results.persons}
               clusterActing={clusterActing}
+              bulkActing={bulkActing}
               onAssign={assignCluster}
               onCreate={createFromCluster}
               onDismiss={dismissClusterFaces}
-              onDismissAllSingletons={dismissAllSingletons}
+              onDismissAllBystanders={dismissAllBystanders}
             />
           )}
 
@@ -778,19 +795,21 @@ function TabButton({ label, count, active, onClick, disabled }: {
 // ── Misc cluster list ───────────────────────────────────────────────────────────
 
 function MiscClusterList({
-  clusters, totalFaces, persons, clusterActing,
-  onAssign, onCreate, onDismiss, onDismissAllSingletons,
+  clusters, totalFaces, persons, clusterActing, bulkActing,
+  onAssign, onCreate, onDismiss, onDismissAllBystanders,
 }: {
   clusters: MiscCluster[]
   totalFaces: number
   persons: { name: string; person_id: string; photo_count: number }[]
   clusterActing: Set<number>
+  bulkActing: boolean
   onAssign: (clusterId: number, faceIds: string[], personId: string) => void
   onCreate: (clusterId: number, faceIds: string[], name: string) => void
   onDismiss: (clusterId: number, faceIds: string[]) => void
-  onDismissAllSingletons: () => void
+  onDismissAllBystanders: () => void
 }) {
   const [lightbox, setLightbox] = useState<{ cluster: MiscCluster; index: number } | null>(null)
+  const [showBystanders, setShowBystanders] = useState(false)
 
   // Esc closes the face-in-context view, arrows flip through its samples
   useEffect(() => {
@@ -814,8 +833,11 @@ function MiscClusterList({
     )
   }
 
-  const repeated   = clusters.filter(c => c.size >= 2)
-  const singletons = clusters.filter(c => c.size === 1)
+  const recurring  = clusters.filter(c => c.size >= MIN_REVIEW_APPEARANCES)
+  const bystanders = clusters.filter(c => c.size < MIN_REVIEW_APPEARANCES)
+  const bystanderFaces  = bystanders.reduce((n, c) => n + c.size, 0)
+  // a 1–2-face cluster carries every face as a representative, so this photo count is exact
+  const bystanderPhotos = new Set(bystanders.flatMap(c => c.representatives.map(r => r.photo_id))).size
   const lb = lightbox && clusters.some(c => c.cluster_id === lightbox.cluster.cluster_id) ? lightbox : null
 
   return (
@@ -846,13 +868,15 @@ function MiscClusterList({
         </FaceLightbox>
       )}
 
-      {repeated.length > 0 && (
-        <div style={{ marginBottom: 24 }}>
-          <div style={{ fontSize: 12, fontWeight: 600, color: '#71717A', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 10 }}>
-            Repeated appearances
-          </div>
+      {/* Faces seen 3+ times — worth a decision each */}
+      <div style={{ marginBottom: 24 }}>
+        <div style={{ display: 'flex', alignItems: 'baseline', gap: 8, marginBottom: 10 }}>
+          <span style={sectionLabel}>Recurring faces</span>
+          <span style={{ fontSize: 12, color: '#71717A' }}>seen in {MIN_REVIEW_APPEARANCES}+ photos — probably someone you know</span>
+        </div>
+        {recurring.length > 0 ? (
           <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
-            {repeated.map(c => (
+            {recurring.map(c => (
               <MiscClusterRow
                 key={c.cluster_id}
                 cluster={c}
@@ -865,38 +889,86 @@ function MiscClusterList({
               />
             ))}
           </div>
-        </div>
-      )}
+        ) : (
+          <p style={{ fontSize: 13, color: 'var(--text-muted)' }}>
+            Nobody unassigned appears {MIN_REVIEW_APPEARANCES} or more times.
+          </p>
+        )}
+      </div>
 
-      {singletons.length > 0 && (
+      {/* Faces seen once or twice — collapsed, one Dismiss-all; expand to rescue a friend */}
+      {bystanders.length > 0 && (
         <div>
-          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 10 }}>
-            <span style={{ fontSize: 12, fontWeight: 600, color: '#71717A', textTransform: 'uppercase', letterSpacing: '0.06em' }}>
-              One-off appearances
-            </span>
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, marginBottom: 10 }}>
             <button
-              onClick={onDismissAllSingletons}
-              style={{ fontSize: 12, fontWeight: 600, color: '#a1a1aa', background: 'transparent', border: '1px solid var(--border)', borderRadius: 7, padding: '5px 12px', cursor: 'pointer' }}
+              onClick={() => setShowBystanders(s => !s)}
+              title={showBystanders ? 'Hide bystanders' : 'Show bystanders'}
+              style={{ display: 'flex', alignItems: 'center', gap: 8, background: 'transparent', border: 'none', padding: 0, cursor: 'pointer', minWidth: 0 }}
             >
-              Dismiss all strangers ({singletons.length})
-            </button>
-          </div>
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(110px, 1fr))', gap: 10 }}>
-            {singletons.map(c => (
-              <MiscSingletonCard
-                key={c.cluster_id}
-                cluster={c}
-                persons={persons}
-                acting={clusterActing.has(c.cluster_id)}
-                onAssign={(pid) => onAssign(c.cluster_id, c.face_ids, pid)}
-                onCreate={(name) => onCreate(c.cluster_id, c.face_ids, name)}
-                onDismiss={() => onDismiss(c.cluster_id, c.face_ids)}
-                onOpen={() => setLightbox({ cluster: c, index: 0 })}
+              <ChevronDown
+                size={16}
+                style={{ color: '#71717A', flexShrink: 0, transform: showBystanders ? 'none' : 'rotate(-90deg)', transition: 'transform 0.15s' }}
               />
-            ))}
+              <span style={sectionLabel}>Bystanders</span>
+              <span style={{ fontSize: 12, fontWeight: 600, color: '#a1a1aa', background: 'var(--surface)', border: '1px solid var(--border)', borderRadius: 20, padding: '2px 9px', whiteSpace: 'nowrap' }}>
+                {bystanderFaces} face{bystanderFaces !== 1 ? 's' : ''} in {bystanderPhotos} photo{bystanderPhotos !== 1 ? 's' : ''}
+              </span>
+              <span style={{ fontSize: 12, color: '#71717A' }}>
+                seen once or twice — almost always strangers · {showBystanders ? 'hide' : 'show'}
+              </span>
+            </button>
+            <DismissAllButton faces={bystanderFaces} acting={bulkActing} onConfirm={onDismissAllBystanders} />
           </div>
+          {showBystanders && (
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(110px, 1fr))', gap: 10 }}>
+              {bystanders.map(c => (
+                <MiscSingletonCard
+                  key={c.cluster_id}
+                  cluster={c}
+                  persons={persons}
+                  acting={clusterActing.has(c.cluster_id)}
+                  onAssign={(pid) => onAssign(c.cluster_id, c.face_ids, pid)}
+                  onCreate={(name) => onCreate(c.cluster_id, c.face_ids, name)}
+                  onDismiss={() => onDismiss(c.cluster_id, c.face_ids)}
+                  onOpen={() => setLightbox({ cluster: c, index: 0 })}
+                />
+              ))}
+            </div>
+          )}
         </div>
       )}
+    </div>
+  )
+}
+
+// Two clicks to dismiss every bystander at once — there is no undo for a dismissal.
+function DismissAllButton({ faces, acting, onConfirm }: { faces: number; acting: boolean; onConfirm: () => void }) {
+  const [armed, setArmed] = useState(false)
+  const ghost: React.CSSProperties = {
+    fontSize: 12, fontWeight: 600, color: '#a1a1aa', background: 'transparent',
+    border: '1px solid var(--border)', borderRadius: 7, padding: '5px 12px', cursor: 'pointer', whiteSpace: 'nowrap',
+  }
+
+  if (acting) {
+    return (
+      <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, fontSize: 12, color: '#71717A', whiteSpace: 'nowrap' }}>
+        <Loader2 size={12} className="animate-spin" /> Dismissing…
+      </span>
+    )
+  }
+  if (!armed) {
+    return <button onClick={() => setArmed(true)} style={ghost}>Dismiss all bystanders</button>
+  }
+  return (
+    <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexShrink: 0 }}>
+      <span style={{ fontSize: 12, color: '#a1a1aa', whiteSpace: 'nowrap' }}>Photos with nobody named move to Places.</span>
+      <button
+        onClick={() => { setArmed(false); onConfirm() }}
+        style={{ ...ghost, color: '#000', background: '#f59e0b', border: 'none' }}
+      >
+        Dismiss {faces} face{faces !== 1 ? 's' : ''}
+      </button>
+      <button onClick={() => setArmed(false)} style={ghost}>Cancel</button>
     </div>
   )
 }
@@ -1065,17 +1137,27 @@ function MiscSingletonCard({ cluster, persons, acting, onAssign, onCreate, onDis
   if (!expanded) {
     return (
       <div style={{ background: 'var(--surface)', border: '1px solid var(--border)', borderRadius: 10, padding: 8, textAlign: 'center' }}>
-        {crop ? (
-          <img
-            src={`data:image/jpeg;base64,${crop}`}
-            onClick={onOpen}
-            title="See this face in its photo"
-            style={{ width: '100%', aspectRatio: '1', objectFit: 'cover', borderRadius: 7, marginBottom: 6, display: 'block', cursor: 'zoom-in' }}
-            alt=""
-          />
-        ) : (
-          <div style={{ width: '100%', aspectRatio: '1', background: 'var(--surface-2)', borderRadius: 7, marginBottom: 6 }} />
-        )}
+        <div style={{ position: 'relative', marginBottom: 6 }}>
+          {crop ? (
+            <img
+              src={`data:image/jpeg;base64,${crop}`}
+              onClick={onOpen}
+              title="See this face in its photo"
+              style={{ width: '100%', aspectRatio: '1', objectFit: 'cover', borderRadius: 7, display: 'block', cursor: 'zoom-in' }}
+              alt=""
+            />
+          ) : (
+            <div style={{ width: '100%', aspectRatio: '1', background: 'var(--surface-2)', borderRadius: 7 }} />
+          )}
+          {cluster.size > 1 && (
+            <span
+              title={countLabel(cluster)}
+              style={{ position: 'absolute', top: 5, right: 5, fontSize: 10, fontWeight: 700, color: '#fff', background: 'rgba(8,8,11,.72)', borderRadius: 10, padding: '1px 6px', pointerEvents: 'none' }}
+            >
+              ×{cluster.size}
+            </span>
+          )}
+        </div>
         <div style={{ display: 'flex', gap: 4 }}>
           <button
             onClick={() => setExpanded(true)}

@@ -18,8 +18,10 @@ def start_classify(trip_id: str, session: Session = Depends(get_session)):
     trip = crud.get_trip(session, trip_id)
     if not trip:
         raise HTTPException(404, "Trip not found")
-    if trip.status not in ("enrolled", "failed"):
-        raise HTTPException(409, f"Classification requires status 'enrolled', current: '{trip.status}'")
+    # Re-running on a classified trip is idempotent: matching only touches
+    # unassigned faces, scene labelling only fills photos without a label.
+    if trip.status not in ("enrolled", "classified", "failed"):
+        raise HTTPException(409, f"Classification requires status 'enrolled' or 'classified', current: '{trip.status}'")
     start_classify_thread(trip_id)
     return {"status": "started", "trip_id": trip_id}
 
@@ -80,23 +82,22 @@ def get_results(trip_id: str, session: Session = Depends(get_session)):
 
     persons.sort(key=lambda x: -x["photo_count"])
 
-    scene_photos = (
-        session.query(Photo)
-        .filter(Photo.trip_id == trip_id, Photo.face_count == 0, Photo.scene_label.isnot(None))
-        .all()
-    )
-    scene_counts: dict[str, int] = {}
-    for p in scene_photos:
-        scene_counts[p.scene_label] = scene_counts.get(p.scene_label, 0) + 1
+    # Places = photos with no routable face (crud.places_photo_filter), bucketed
+    # by scene label; unlabelled ones count as "other", exactly as the Drive
+    # output files them.
+    scene_label = func.coalesce(Photo.scene_label, "other")
+    scene_counts: dict[str, int] = {
+        label: count
+        for label, count in (
+            session.query(scene_label, func.count(Photo.id))
+            .filter(crud.places_photo_filter(trip_id))
+            .group_by(scene_label)
+        )
+    }
 
     misc_count = (
-        session.query(func.count(func.distinct(FaceObservation.photo_id)))
-        .join(Photo, Photo.id == FaceObservation.photo_id)
-        .filter(
-            Photo.trip_id == trip_id,
-            FaceObservation.person_id.is_(None),
-            FaceObservation.is_stranger == False,
-        )
+        session.query(func.count(Photo.id))
+        .filter(crud.misc_photo_filter(trip_id))
         .scalar()
     ) or 0
 

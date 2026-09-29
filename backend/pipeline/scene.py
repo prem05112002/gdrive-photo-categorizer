@@ -1,5 +1,9 @@
 """
-Scene classification for no-face photos — SigLIP 2 zero-shot, batched, on MPS.
+Scene classification — SigLIP 2 zero-shot, batched, on MPS.
+
+Labels every processable photo, not just the no-face ones: a photo whose only
+faces are low-quality or dismissed is filed under Places/{label}, and a label on
+every photo is what "Places for everyone" will need later.
 
 Runs in-process: the old FAISS/PyTorch libomp conflict is gone now that face
 matching uses plain numpy (see pipeline/classify.py), so no subprocess needed.
@@ -13,6 +17,7 @@ import torch
 from PIL import Image, ImageOps
 import pillow_heif
 
+from database import crud
 from database.models import Photo
 
 pillow_heif.register_heif_opener()
@@ -86,33 +91,30 @@ def classify_scenes(
     session,
     trip_id: str,
     progress_cb: Optional[Callable[[int, int], None]] = None,
+    only_missing: bool = True,
 ) -> int:
     """
-    Zero-shot scene-label every no-face photo of the trip.
-    Returns the number of photos labeled. Commits per batch.
+    Zero-shot scene-label the trip's photos (RAW, video and duplicates excluded).
+
+    only_missing (default) skips photos that already carry a label, so re-running
+    classification neither redoes work nor overwrites labels the user corrected
+    in the gallery. Returns the number of photos labeled. Commits per batch.
     """
-    no_face = (
-        session.query(Photo)
-        .filter(
-            Photo.trip_id == trip_id,
-            Photo.face_count == 0,
-            Photo.is_raw == False,
-            Photo.is_video == False,
-            Photo.is_duplicate == False,
-        )
-        .all()
-    )
-    if not no_face:
+    query = session.query(Photo).filter(crud.processable_photo_filter(trip_id))
+    if only_missing:
+        query = query.filter(Photo.scene_label.is_(None))
+    photos = query.all()
+    if not photos:
         return 0
 
     model, preprocess, text_feats, device = get_encoder()
-    total = len(no_face)
+    total = len(photos)
     labeled = 0
 
     # Snapshot paths before the loop — the per-batch commit expires ORM
     # attributes, and decode threads must never trigger a lazy reload on the
     # shared (non-thread-safe) session.
-    paths = {p.id: p.local_path for p in no_face}
+    paths = {p.id: p.local_path for p in photos}
 
     def load(path: Optional[str]) -> Optional[torch.Tensor]:
         try:
@@ -125,7 +127,7 @@ def classify_scenes(
 
     with ThreadPoolExecutor(max_workers=DECODE_WORKERS) as pool:
         for start in range(0, total, BATCH_SIZE):
-            batch = no_face[start:start + BATCH_SIZE]
+            batch = photos[start:start + BATCH_SIZE]
             tensors = list(pool.map(load, [paths[p.id] for p in batch]))
 
             valid = [(p, t) for p, t in zip(batch, tensors) if t is not None]

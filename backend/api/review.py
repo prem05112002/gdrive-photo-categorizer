@@ -16,14 +16,12 @@ def get_misc_faces(trip_id: str, session: Session = Depends(get_session)):
     if not trip:
         raise HTTPException(404, "Trip not found")
 
+    # Every face that still needs a decision — the same set misc-clusters
+    # groups and the gallery's Misc tab is built from.
     rows = (
         session.query(FaceObservation, Photo)
         .join(Photo, Photo.id == FaceObservation.photo_id)
-        .filter(
-            Photo.trip_id == trip_id,
-            FaceObservation.person_id.is_(None),
-            FaceObservation.is_stranger == False,
-        )
+        .filter(Photo.trip_id == trip_id, crud.routable_unmatched_face_filter())
         .order_by(FaceObservation.confidence.desc())
         .all()
     )

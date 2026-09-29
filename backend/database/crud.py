@@ -1,5 +1,5 @@
 from sqlalchemy.orm import Session
-from sqlalchemy import func
+from sqlalchemy import and_, exists, func
 from typing import Optional
 from .models import Trip, Photo, Person, FaceObservation, TripPerson, PersonEmbedding
 
@@ -123,3 +123,70 @@ def add_person_to_trip(session: Session, trip_id: str, person_id: str) -> None:
     if not exists:
         session.add(TripPerson(trip_id=trip_id, person_id=person_id))
         session.commit()
+
+
+# ── Photo routing ──────────────────────────────────────────────────────────────
+#
+# The single definition of where a photo goes. The Drive output builder, the
+# classify results, the gallery and the review queue all read it from here so
+# they cannot drift apart (BUGS.md #12 was exactly that drift).
+#
+#   Person folders   photo has ≥1 face assigned to a person.
+#   Misc             photo has ≥1 *routable unmatched* face: unassigned, not
+#                    dismissed as a stranger, and not hidden by the quality gate.
+#                    Low-quality unmatched faces never route a photo anywhere —
+#                    they are too blurry/small for a human to review, so they are
+#                    matched automatically or ignored.
+#   Places/{scene}   photo has no routable face at all: no faces, or every face
+#                    is low-quality or dismissed. Photos that contain a member go
+#                    only to the person folders (Places-for-everyone is a
+#                    separate, later decision).
+#
+# A photo can be in person folders and Misc at once (a member plus an unknown
+# face); Places is exclusive with both.
+
+
+def routable_unmatched_face_filter():
+    """Criteria for a FaceObservation that still needs a human decision."""
+    return and_(
+        FaceObservation.person_id.is_(None),
+        FaceObservation.is_stranger == False,     # noqa: E712 — SQL boolean
+        FaceObservation.is_low_quality == False,  # noqa: E712
+    )
+
+
+def _photo_has_face(*criteria):
+    """EXISTS (face of the outer Photo row matching criteria)."""
+    return exists().where(FaceObservation.photo_id == Photo.id, *criteria)
+
+
+def photo_has_member():
+    return _photo_has_face(FaceObservation.person_id.isnot(None))
+
+
+def photo_has_routable_unmatched():
+    return _photo_has_face(routable_unmatched_face_filter())
+
+
+def processable_photo_filter(trip_id: str):
+    """Photos that get routed at all — not RAW, video or duplicate."""
+    return and_(
+        Photo.trip_id == trip_id,
+        Photo.is_raw == False,        # noqa: E712
+        Photo.is_video == False,      # noqa: E712
+        Photo.is_duplicate == False,  # noqa: E712
+    )
+
+
+def misc_photo_filter(trip_id: str):
+    """Photos that belong in Misc: at least one routable unmatched face."""
+    return and_(processable_photo_filter(trip_id), photo_has_routable_unmatched())
+
+
+def places_photo_filter(trip_id: str):
+    """Photos that belong in Places/{scene}: nobody named, nothing left to review."""
+    return and_(
+        processable_photo_filter(trip_id),
+        ~photo_has_member(),
+        ~photo_has_routable_unmatched(),
+    )

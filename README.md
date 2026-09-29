@@ -77,7 +77,7 @@ Every detected face is scored before it can reach clustering. A face is flagged 
 | Face size (detection space) | < 40 px |
 | Sharpness (Laplacian variance of the crop) | < 45 |
 
-Low-quality faces are stored (they still render in the gallery) but are hidden from the enrollment review queue — they get matched automatically during classification instead. This is the main fix for the "hundreds of singletons to review" problem.
+Low-quality faces are stored (they still render in the gallery) but are hidden from the enrollment review queue — they get matched automatically during classification instead. This is the main fix for the "hundreds of singletons to review" problem. They also never route a photo: a photo whose only unmatched faces are low-quality goes to its members' folders, or to Places by scene if nobody named is in it — never to Misc.
 
 ---
 
@@ -336,11 +336,11 @@ Open **http://localhost:5173** — that's the only URL you need to use.
 
 4. **Enroll people** — clusters of similar faces are shown. Type a name for each cluster. One-off faces live in a collapsed "Needs review" section; faces that look like an already-named member show a one-tap "Might be X ✓" chip. Dismiss strangers you don't want to track.
 
-5. **Classify** — remaining faces are matched to your enrolled registry (with a lookalike margin rule). SigLIP 2 labels all no-face photos by scene.
+5. **Classify** — remaining faces are matched to your enrolled registry (with a lookalike margin rule). SigLIP 2 labels every photo by scene; photos with nobody named in them are filed under Places.
 
 6. **Body detection** (optional but recommended) — YOLO11 finds people in every photo using full-body detection and matches them to enrolled members by outfit embedding. Useful for photos where faces are obscured or too small to detect.
 
-7. **Review** — check the Persons tab (face counts per person), the Gallery tab (browse by scene), and the Misc tab (faces that couldn't be auto-matched). Reassign or dismiss any errors.
+7. **Review** — check the Persons tab (face counts per person), the Gallery tab (browse by scene), and the Misc Faces tab (faces that couldn't be auto-matched: anyone seen in 3+ photos gets a card, one-off bystanders collapse into a single Dismiss-all). Reassign or dismiss any errors.
 
 8. **Upload to Drive** — creates `[Organized]/` inside your source folder. Shortcuts (not copies) are organized by person name, scene label, and RAW. Original files are never touched.
 

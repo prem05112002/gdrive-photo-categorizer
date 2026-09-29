@@ -84,7 +84,7 @@ def _run_classify(trip_id: str) -> None:
         _classify_progress[trip_id] = {"status": "running", "step": "face_match"}
         faces_matched = _match_faces(session, trip_id)
 
-        # ── 2. Scene-label no-face photos (SigLIP 2, in-process) ──────────
+        # ── 2. Scene-label photos that have no label yet (SigLIP 2, in-process) ──
         _classify_progress[trip_id] = {"status": "running", "step": "loading_scene_model"}
 
         from pipeline.scene import classify_scenes

@@ -166,3 +166,19 @@ These defaults were validated on synthetic data and probes, not yet on a full re
 ## Added dependencies
 
 - `transformers` (SigLIP2 tokenizer backend), `ultralytics` (now pinned in `requirements.txt` — previously used but undeclared)
+
+---
+
+# Misc redefinition — 2026-09-29
+
+Measured on Kochi (1139 photos, 1389 faces, 6 members) after Prem's classify run.
+
+**Problem:** Misc held 152 photos but only 67 contained a face the Review page could show. The other 85 were dragged in by *low-quality* unmatched faces that the quality gate hides from review — 34 of them already sat in a member's folder. Separately, a photo whose faces were all dismissed landed nowhere in `[Organized]`: not a person folder, not Places (`face_count > 0`), not Misc — so dismissing bystanders silently lost photos. "Unmatched" was computed in four places and none of them looked at `is_low_quality` (BUGS.md #12).
+
+**Changes:**
+- **One routing definition** in `database/crud.py`: `routable_unmatched_face_filter()` (unassigned, not dismissed, not low-quality), `misc_photo_filter()`, `places_photo_filter()` (no member *and* no routable face). Used by `drive/output.py`, `api/classify.py::get_results`, `api/gallery.py`, `api/review.py` and `enrollment/cluster.py`. Low-quality unmatched faces never route a photo anywhere.
+- **Drive output split into planner + builder.** `plan_trip_output()` decides every shortcut from the DB alone (no Drive calls, so it can be dry-run); `build_trip_output()` creates only the folders the plan needs. Photos with no routable face go to `Places/{scene}` even when they contain faces; photos with a member still go only to person folders.
+- **Scene labels for every photo** (`pipeline/scene.py`), not just `face_count == 0`. Re-runs label only photos without a label, so gallery corrections survive. `POST /api/classify/{id}/run` now accepts a `classified` trip (idempotent: matching only touches unassigned faces) and TripDetail shows a Re-run link next to the results.
+- **Review → Bystanders.** Unassigned clusters seen in fewer than `MIN_REVIEW_APPEARANCES = 3` photos collapse into one section with a two-click "Dismiss all bystanders"; expanded, pairs carry a ×2 badge. Dismissing refreshes the Places count in the sidebar.
+
+**Numbers (Kochi):** Misc 152 → 67 with no user action; Places 398 → 449 (the 51 member-less photos whose faces are all low-quality, filed by scene); the 34 member photos with low-quality extras stay person-only; a plan dry-run routes all 1139 processable photos (1699 shortcuts, 0 unrouted). The backfill labelled the 741 face photos and left the 398 existing labels untouched. Review queue: 2 recurring clusters + 64 bystander clusters (79 faces in 60 photos) instead of 66 cards to click through.
