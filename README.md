@@ -402,3 +402,5 @@ Open **http://localhost:5173** — that's the only URL you need to use.
 - **Resumable by design** — ingest skips already-downloaded files, face extraction clears its own partial output, and re-running the upload into an existing `[Organized]/` tree checks for existing shortcuts before creating new ones.
 
 Full details of the v2 optimization pass (what changed and why, plus every tuning threshold): [`docs/CHANGELOG-v2.md`](docs/CHANGELOG-v2.md).
+
+Every problem hit so far, its root cause and the rule that prevents it, grouped by area: [`docs/LESSONS.md`](docs/LESSONS.md). Read the section for the area you are about to touch.

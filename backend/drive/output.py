@@ -236,11 +236,8 @@ def _run_upload(trip_id: str) -> None:
 
         shortcuts, root_id = build_trip_output(service, session, trip_id, on_progress)
 
-        session.query(Trip).filter(Trip.id == trip_id).update({
-            "status": "uploaded",
-            "output_folder_id": root_id,
-        })
-        session.commit()
+        session.query(Trip).filter(Trip.id == trip_id).update({"output_folder_id": root_id})
+        crud.update_trip_status(session, trip_id, "uploaded")  # also refreshes last_good_status
 
         _upload_progress[trip_id] = {
             "status": "done",

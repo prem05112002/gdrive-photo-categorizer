@@ -182,3 +182,25 @@ Measured on Kochi (1139 photos, 1389 faces, 6 members) after Prem's classify run
 - **Review → Bystanders.** Unassigned clusters seen in fewer than `MIN_REVIEW_APPEARANCES = 3` photos collapse into one section with a two-click "Dismiss all bystanders"; expanded, pairs carry a ×2 badge. Dismissing refreshes the Places count in the sidebar.
 
 **Numbers (Kochi):** Misc 152 → 67 with no user action; Places 398 → 449 (the 51 member-less photos whose faces are all low-quality, filed by scene); the 34 member photos with low-quality extras stay person-only; a plan dry-run routes all 1139 processable photos (1699 shortcuts, 0 unrouted). The backfill labelled the 741 face photos and left the 398 existing labels untouched. Review queue: 2 recurring clusters + 64 bystander clusters (79 faces in 60 photos) instead of 66 cards to click through.
+
+---
+
+# Orientation, re-run safety, status machine — 2026-09-29 (later the same day)
+
+Prem's three bug reports after the Misc redefinition, plus what fixing them uncovered.
+
+**Rotated face crops in Review → rotate-and-retry.** Some files are stored sideways with no EXIF tag (Kochi: 227 of 1389 faces, mostly the Canon held in portrait), so `exif_transpose` cannot upright them. `pipeline/face.py` now reads the in-plane roll off the detector's eye keypoints; a face more than a quarter turn off gets the whole image turned upright and detected again (one extra detector pass per photo and angle, cached), and that embedding + crop are kept. `FaceObservation.rotation` (0/90/180/270, counter-clockwise) records the turn and `/photos/{p}/face/{f}/context` turns its crop the same way. Measured before the change: sideways faces had a 0.26 mean best registry similarity vs 0.69 upright, and 11 of 13 probed "strangers" were members. After the re-run + classify: 186 of the 227 sideways faces re-detected upright, 21 more faces auto-matched (Nandika +12, Siddarth +6, three others +1), Misc 66 → 60 photos, review queue 66 → 60 clusters (2 recurring + 58 bystanders), low-quality faces 263 → 227 (uprighting raises detector confidence).
+
+**Face re-run keeps human decisions.** Re-running extraction used to delete every `person_id IS NULL` row and insert all detections again — on an enrolled trip that would have duplicated every named face (1188 on Kochi) into a second, unassigned row headed for Review, and deleted dismissed faces. Rows that carry a decision (named or dismissed) now survive and are refreshed in place when a new detection overlaps them (IoU ≥ 0.5); the rest are replaced. An already-enrolled trip lands back at `enrolled` (roster intact; classify again), not `faces_extracted`. Verified on Kochi: 1389 faces before and after, 0 overlapping pairs, `face_count` == rows for all 1139 photos, 94 s on CoreML.
+
+**Trip status machine.** `pipeline/classify.py`, `pipeline/body.py`, `drive/output.py` and `enrollment/router.py` wrote `Trip.status` directly, so `last_good_status` went stale (Kochi sat at `classified` / `faces_extracted`) and the first failed upload would have rolled the trip page back to "Start Enrollment". Every transition now goes through `crud.update_trip_status`.
+
+**`create_all()` never adds columns → startup migration.** `database/models.py::_ensure_columns()` adds any model column the live SQLite file lacks (additive only; removals and type changes still need a hand-written migration).
+
+**Drive token self-heals.** A refresh rejected with `invalid_grant` (the 7-day Testing-mode expiry) now drops `token.json` and re-runs the consent flow (browser window on this machine) instead of failing every Drive call until someone deletes the file by hand.
+
+**Per-trip counts.** `GET /classify/{id}/results` and `GET /enrollment/{id}/persons` counted a person's faces across all trips; both now join `Photo` and filter by trip, like the gallery does.
+
+**Gallery lightbox.** A portrait photo rendered 1547 px tall in an 813 px viewport and the wheel scrolled the grid behind the overlay: the image container is a `flex: 1` item whose default `min-height: auto` let the image's `maxHeight: 100%` resolve against itself. `minHeight: 0` + `overflow: hidden` on the photo column and container, and body scroll is locked while the lightbox is open. Measured after: 703 px tall, page scroll stays at 0.
+
+**Docs:** `docs/LESSONS.md` — every problem hit since Phase 0 with its root cause and prevention rule, grouped by area, plus a checklist for new pipeline steps, models, endpoints, overlays and DB columns.

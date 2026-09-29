@@ -181,6 +181,8 @@ def name_cluster(trip_id: str, payload: NameClusterPayload, session: Session = D
 
     if trip.status == "faces_extracted":
         trip.status = "enrolled"
+        trip.last_good_status = "enrolled"   # what a failure later falls back to
+        trip.error_message = None
 
     session.commit()
     return {"person_id": person.id, "name": person.name}
@@ -272,7 +274,8 @@ def get_enrolled_persons(trip_id: str, session: Session = Depends(get_session)):
     for person, _ in rows:
         face_count = (
             session.query(func.count(FaceObservation.id))
-            .filter(FaceObservation.person_id == person.id)
+            .join(Photo, Photo.id == FaceObservation.photo_id)
+            .filter(Photo.trip_id == trip_id, FaceObservation.person_id == person.id)
             .scalar()
         ) or 0
         thumbnail_b64 = base64.b64encode(person.thumbnail).decode() if person.thumbnail else None

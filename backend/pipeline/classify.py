@@ -98,8 +98,7 @@ def _run_classify(trip_id: str) -> None:
         scenes_labeled = classify_scenes(session, trip_id, on_progress)
 
         session.expire_all()
-        session.query(Trip).filter(Trip.id == trip_id).update({"status": "classified"})
-        session.commit()
+        crud.update_trip_status(session, trip_id, "classified")  # also refreshes last_good_status
         _classify_progress[trip_id] = {
             "status": "done",
             "faces_matched": faces_matched,

@@ -111,6 +111,16 @@ export function Gallery() {
     return () => window.removeEventListener('keydown', onKey)
   }, [lightbox])
 
+  // Lock the page while the lightbox is open — the wheel used to scroll the
+  // grid behind the overlay while the photo stayed put.
+  const lightboxOpen = lightbox !== null
+  useEffect(() => {
+    if (!lightboxOpen) return
+    const prev = document.body.style.overflow
+    document.body.style.overflow = 'hidden'
+    return () => { document.body.style.overflow = prev }
+  }, [lightboxOpen])
+
   // ── Helpers ───────────────────────────────────────────────────────────────
 
   function moveLightbox(dir: -1 | 1) {
@@ -483,7 +493,7 @@ export function Gallery() {
           onClick={e => { if (e.target === e.currentTarget) setLightbox(null) }}
         >
           {/* Photo area */}
-          <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minWidth: 0 }}>
+          <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minWidth: 0, minHeight: 0 }}>
             {/* Top bar */}
             <div style={{ display: 'flex', alignItems: 'center', padding: '12px 16px', gap: 12 }}>
               <button
@@ -500,10 +510,12 @@ export function Gallery() {
               </span>
             </div>
 
-            {/* Image */}
+            {/* Image — minHeight: 0 matters: a flex item's default min-height is its
+                content height, so the image's maxHeight: 100% resolved against itself
+                and portrait photos ran twice the viewport with Prev/Next off-screen */}
             <div
               ref={imgContainerRef}
-              style={{ flex: 1, position: 'relative', display: 'flex', alignItems: 'center', justifyContent: 'center' }}
+              style={{ flex: 1, minHeight: 0, overflow: 'hidden', position: 'relative', display: 'flex', alignItems: 'center', justifyContent: 'center' }}
             >
               <img
                 key={lbPhoto.photoId}

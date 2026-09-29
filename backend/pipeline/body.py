@@ -124,8 +124,7 @@ def _run_body(trip_id: str) -> None:
     session = SessionLocal()
     try:
         _body_progress[trip_id] = {"status": "running", "step": "loading_model"}
-        session.query(Trip).filter(Trip.id == trip_id).update({"status": "body_detecting"})
-        session.commit()
+        crud.update_trip_status(session, trip_id, "body_detecting")
 
         photos = (
             session.query(Photo)
@@ -271,11 +270,7 @@ def _run_body(trip_id: str) -> None:
                 session.commit()
 
         session.expire_all()
-        session.query(Trip).filter(Trip.id == trip_id).update({
-            "status": "body_detected",
-            "last_good_status": "body_detected",
-        })
-        session.commit()
+        crud.update_trip_status(session, trip_id, "body_detected")
         _body_progress[trip_id] = {
             "status": "done",
             "bodies_found": bodies_found,

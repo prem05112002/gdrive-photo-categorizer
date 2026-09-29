@@ -114,7 +114,11 @@ class FaceObservation(Base):
     blur_score = Column(Float)          # Laplacian variance of the face crop
     is_low_quality = Column(Boolean, default=False)  # fails quality gate — excluded from clustering
     is_stranger = Column(Boolean, default=False)
-    face_crop = Column(LargeBinary)  # JPEG bytes of cropped face (256×256)
+    # Counter-clockwise quarter turn (0/90/180/270) that makes this face upright.
+    # Set when the photo's pixels are sideways with no EXIF tag; the stored crop
+    # is already turned, the context endpoint turns its crop by the same amount.
+    rotation = Column(Integer, default=0)
+    face_crop = Column(LargeBinary)  # JPEG bytes of cropped face (256×256), upright
     drive_shortcut_id = Column(String)  # Drive shortcut file ID in person's folder (set during upload)
 
     photo = relationship("Photo", back_populates="face_observations")
@@ -174,8 +178,39 @@ class PotentialMisclassification(Base):
     status = Column(String, default="pending_review")   # pending_review | confirmed | dismissed
 
 
+def _ensure_columns() -> None:
+    """
+    create_all() never ALTERs an existing table, so every column added to a
+    model used to crash at insert time with "no column named X" until someone
+    ran the ALTER by hand (BUGS.md #3 — bitten three times). Add any column the
+    models declare that the live SQLite file lacks. Additive only: never drops
+    or retypes, so it is safe to run on every start.
+    """
+    from sqlalchemy import inspect, text
+    insp = inspect(engine)
+    with engine.begin() as conn:
+        for table in Base.metadata.sorted_tables:
+            if not insp.has_table(table.name):
+                continue  # create_all() just made it, complete with columns
+            existing = {c["name"] for c in insp.get_columns(table.name)}
+            for col in table.columns:
+                if col.name in existing:
+                    continue
+                ddl = f"ALTER TABLE {table.name} ADD COLUMN {col.name} {col.type.compile(engine.dialect)}"
+                default = col.default.arg if col.default is not None and not callable(col.default.arg) else None
+                if isinstance(default, bool):
+                    ddl += f" DEFAULT {int(default)}"
+                elif isinstance(default, (int, float)):
+                    ddl += f" DEFAULT {default}"
+                elif isinstance(default, str):
+                    ddl += " DEFAULT '" + default.replace("'", "''") + "'"
+                conn.execute(text(ddl))
+                print(f"[db] added column {table.name}.{col.name}")
+
+
 def init_db():
     Base.metadata.create_all(bind=engine)
+    _ensure_columns()
 
 
 def get_session():

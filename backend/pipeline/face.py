@@ -1,5 +1,6 @@
 import io
 import itertools
+import math
 import threading
 import uuid
 from collections import deque
@@ -11,6 +12,7 @@ import cv2
 import numpy as np
 from PIL import Image, ImageOps
 import pillow_heif
+from sqlalchemy import or_
 
 from database.models import SessionLocal, Photo, FaceObservation
 from database import crud  # noqa: F401 — used in error handler
@@ -30,6 +32,24 @@ COMMIT_BATCH = 25           # photos per DB commit
 MIN_DET_SCORE = 0.65
 MIN_FACE_SIZE = 40          # px, in detection space (MAX_LONG_SIDE-resized image)
 MIN_BLUR_VAR = 45.0         # Laplacian variance on the gray face crop
+
+# Orientation — some photos are stored sideways with no EXIF tag (Kochi: the
+# Canon held in portrait), so exif_transpose can't upright them. The detector
+# still finds those faces, but ArcFace barely recognises a sideways face
+# (measured: best registry similarity 0.26 sideways vs 0.69 upright, and 11 of
+# 13 such "strangers" were members) and the stored crop is unreadable. So the
+# roll is read off the detector's eye keypoints; a face more than a quarter
+# turn off gets the whole image turned upright and detected again, and that
+# embedding + crop are kept. FaceObservation.rotation records the turn.
+UPRIGHT_ROLL_TOLERANCE = 45.0   # degrees off vertical before a face counts as sideways
+REDETECT_MIN_IOU = 0.5          # the upright detection must overlap the mapped original box
+
+# Re-runs keep every human decision (named/dismissed rows), refresh them in
+# place, and land an already-enrolled trip back at "enrolled" — its roster
+# survives, classification has to run again for the new faces.
+POST_ENROLLMENT_STATUSES = {"enrolled", "classified", "uploaded", "body_detecting", "body_detected"}
+
+_CV2_ROTATE = {90: cv2.ROTATE_90_COUNTERCLOCKWISE, 180: cv2.ROTATE_180, 270: cv2.ROTATE_90_CLOCKWISE}
 
 # ── Progress (mirrors ingest.py pattern) ──────────────────────────────────────
 
@@ -114,8 +134,8 @@ def _load_image(path: Path) -> Optional[np.ndarray]:
         return None
 
 
-def _face_crop_bytes(img: np.ndarray, x1: int, y1: int, x2: int, y2: int) -> bytes:
-    """Crop a face region with padding and return it as JPEG bytes (max 256px)."""
+def _face_crop_bytes(img: np.ndarray, x1: int, y1: int, x2: int, y2: int, rotation: int = 0) -> bytes:
+    """Crop a face region with padding, turn it upright, return JPEG bytes (max 256px)."""
     h, w = img.shape[:2]
     pw = int((x2 - x1) * FACE_PAD)
     ph = int((y2 - y1) * FACE_PAD)
@@ -124,6 +144,8 @@ def _face_crop_bytes(img: np.ndarray, x1: int, y1: int, x2: int, y2: int) -> byt
     cx2 = min(w, x2 + pw)
     cy2 = min(h, y2 + ph)
     crop = Image.fromarray(img[cy1:cy2, cx1:cx2])
+    if rotation:
+        crop = crop.rotate(rotation, expand=True)   # PIL turns counter-clockwise, same as `rotation`
     crop.thumbnail((256, 256))
     buf = io.BytesIO()
     crop.save(buf, format="JPEG", quality=85)
@@ -145,6 +167,68 @@ def _face_quality(img: np.ndarray, x1: int, y1: int, x2: int, y2: int,
         or blur < MIN_BLUR_VAR
     )
     return blur, low
+
+
+# ── Orientation helpers ───────────────────────────────────────────────────────
+
+def _face_roll(face) -> float:
+    """In-plane roll from the eye line, degrees: 0 upright, +90 = top of head points right."""
+    if face.kps is None or len(face.kps) < 2:
+        return 0.0
+    (lx, ly), (rx, ry) = face.kps[0], face.kps[1]
+    return math.degrees(math.atan2(ry - ly, rx - lx))
+
+
+def _upright_rotation(face) -> int:
+    """Counter-clockwise quarter turn (0/90/180/270) that would make the face upright."""
+    roll = _face_roll(face)
+    if abs(roll) <= UPRIGHT_ROLL_TOLERANCE:
+        return 0
+    return int(round(roll / 90.0)) * 90 % 360
+
+
+def _rotate_box(box: tuple, w: int, h: int, rotation: int) -> tuple[float, float, float, float]:
+    """Map an (x1, y1, x2, y2) box of a w×h image through a counter-clockwise quarter turn."""
+    x1, y1, x2, y2 = box
+    if rotation == 90:      # (x, y) → (y, w - x)
+        pts = [(y1, w - x2), (y2, w - x1)]
+    elif rotation == 180:   # (x, y) → (w - x, h - y)
+        pts = [(w - x2, h - y2), (w - x1, h - y1)]
+    else:                   # 270: (x, y) → (h - y, x)
+        pts = [(h - y2, x1), (h - y1, x2)]
+    xs, ys = zip(*pts)
+    return (min(xs), min(ys), max(xs), max(ys))
+
+
+def _iou(a: tuple, b: tuple) -> float:
+    iw = max(0.0, min(a[2], b[2]) - max(a[0], b[0]))
+    ih = max(0.0, min(a[3], b[3]) - max(a[1], b[1]))
+    inter = iw * ih
+    if inter <= 0:
+        return 0.0
+    return inter / ((a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1]) - inter)
+
+
+def _upright_face(model, img: np.ndarray, face, rotation: int, cache: dict):
+    """
+    Detect `face` again on the image turned upright by `rotation`. Rotated images
+    and their detections are cached per photo so several sideways faces in one
+    photo cost one extra detector pass. Returns (upright_face | None, rotated_img).
+    """
+    if rotation not in cache:
+        rimg = cv2.rotate(img, _CV2_ROTATE[rotation])
+        cache[rotation] = (rimg, model.get(cv2.cvtColor(rimg, cv2.COLOR_RGB2BGR)))
+    rimg, dets = cache[rotation]
+    h, w = img.shape[:2]
+    target = _rotate_box(tuple(face.bbox), w, h, rotation)
+    best, best_iou = None, 0.0
+    for d in dets:
+        score = _iou(target, tuple(d.bbox))
+        if score > best_iou:
+            best, best_iou = d, score
+    if best is None or best_iou < REDETECT_MIN_IOU or abs(_face_roll(best)) > UPRIGHT_ROLL_TOLERANCE:
+        return None, rimg
+    return best, rimg
 
 
 def _decoded_stream(items: list[tuple[str, str]]):
@@ -178,14 +262,24 @@ def _decoded_stream(items: list[tuple[str, str]]):
 def run_face_pipeline(trip_id: str) -> None:
     """
     Detect faces in every processable photo for a trip.
-    For each face: stores a FaceObservation with raw 512-dim embedding + face crop
-    + quality flags. Updates Photo.face_count and Photo.is_group_photo.
-    Re-running is idempotent: prior unassigned observations are cleared first.
-    Runs synchronously — call via start_face_pipeline_thread() for background use.
+    For each face: stores a FaceObservation with raw 512-dim embedding + upright
+    face crop + quality flags. Updates Photo.face_count and Photo.is_group_photo.
+
+    Re-running is idempotent and keeps every human decision: observations that
+    are named or dismissed survive and are refreshed in place when the detector
+    finds the same face again (bbox IoU ≥ REDETECT_MIN_IOU); all other
+    observations are re-detected from scratch. A trip that was already enrolled
+    comes back as "enrolled" (its roster is intact) and needs classification
+    again. Runs synchronously — call via start_face_pipeline_thread() for
+    background use.
     """
     session = SessionLocal()
 
     try:
+        trip = crud.get_trip(session, trip_id)
+        prior = trip.last_good_status if trip and trip.status == "failed" else (trip.status if trip else None)
+        resume_status = "enrolled" if prior in POST_ENROLLMENT_STATUSES else "faces_extracted"
+
         photos = [
             p for p in crud.get_photos_by_trip(session, trip_id)
             if not p.is_raw and not p.is_video and not p.is_duplicate and p.local_path
@@ -199,20 +293,38 @@ def run_face_pipeline(trip_id: str) -> None:
                 processed=0,
                 faces_found=0,
                 group_photos=0,
-                low_quality=0)
+                low_quality=0,
+                sideways=0,
+                uprighted=0)
 
         model = get_model()  # downloads buffalo_l on first run (~235 MB)
 
         # Snapshot plain values before any commits — ORM objects must not be
         # shared with the decode threads (see _decoded_stream docstring)
         items = [(p.id, p.local_path) for p in photos]
-
-        # Idempotent re-run: drop unassigned observations from any earlier run
         photo_ids = [pid for pid, _ in items]
+
+        # Rows carrying a human decision (named or dismissed) survive the re-run
+        # and are refreshed in place below; everything else is re-detected.
+        kept: dict[str, list[tuple[str, tuple[int, int, int, int]]]] = {}
         if photo_ids:
+            decided = (
+                session.query(FaceObservation.id, FaceObservation.photo_id,
+                              FaceObservation.bbox_x, FaceObservation.bbox_y,
+                              FaceObservation.bbox_w, FaceObservation.bbox_h)
+                .filter(
+                    FaceObservation.photo_id.in_(photo_ids),
+                    or_(FaceObservation.person_id.isnot(None), FaceObservation.is_stranger == True),  # noqa: E712
+                )
+                .all()
+            )
+            for obs_id, pid, bx, by, bw, bh in decided:
+                if bx is not None:
+                    kept.setdefault(pid, []).append((obs_id, (bx, by, bx + bw, by + bh)))
             session.query(FaceObservation).filter(
                 FaceObservation.photo_id.in_(photo_ids),
                 FaceObservation.person_id.is_(None),
+                or_(FaceObservation.is_stranger.is_(None), FaceObservation.is_stranger == False),  # noqa: E712
             ).delete(synchronize_session=False)
             session.commit()
 
@@ -221,6 +333,8 @@ def run_face_pipeline(trip_id: str) -> None:
         faces_found = 0
         group_photo_count = 0
         low_quality_count = 0
+        sideways_count = 0
+        uprighted_count = 0
         since_commit = 0
 
         for idx, (photo_id, img) in enumerate(_decoded_stream(items)):
@@ -242,27 +356,58 @@ def run_face_pipeline(trip_id: str) -> None:
                 "is_group_photo": is_group,
             })
 
+            rotated: dict[int, tuple[np.ndarray, list]] = {}   # per-photo cache of uprighted images
+            unclaimed = list(kept.get(photo_id, []))
+
             for face in faces:
-                x1, y1, x2, y2 = face.bbox.astype(int)
+                x1, y1, x2, y2 = (int(v) for v in face.bbox)
                 det_score = float(face.det_score)
+                embedding = face.normed_embedding
+                rotation = _upright_rotation(face)
+                if rotation:
+                    sideways_count += 1
+                    upright, rimg = _upright_face(model, img, face, rotation, rotated)
+                    if upright is not None:
+                        uprighted_count += 1
+                        det_score = float(upright.det_score)
+                        embedding = upright.normed_embedding
+                        ux1, uy1, ux2, uy2 = (int(v) for v in upright.bbox)
+                        crop = _face_crop_bytes(rimg, ux1, uy1, ux2, uy2)
+                    else:
+                        crop = _face_crop_bytes(img, x1, y1, x2, y2, rotation)  # readable at least
+                else:
+                    crop = _face_crop_bytes(img, x1, y1, x2, y2)
+
                 blur, low_q = _face_quality(img, x1, y1, x2, y2, det_score)
                 if low_q:
                     low_quality_count += 1
 
-                obs = FaceObservation(
-                    id=str(uuid.uuid4()),
-                    photo_id=photo_id,
-                    raw_embedding=face.normed_embedding.astype(np.float32).tobytes(),  # L2-normalized, norm≈1.0
-                    bbox_x=int(x1),
-                    bbox_y=int(y1),
-                    bbox_w=int(x2 - x1),
-                    bbox_h=int(y2 - y1),
-                    confidence=det_score,
-                    blur_score=blur,
-                    is_low_quality=low_q,
-                    face_crop=_face_crop_bytes(img, x1, y1, x2, y2),
-                )
-                session.add(obs)
+                values = {
+                    "bbox_x": x1,
+                    "bbox_y": y1,
+                    "bbox_w": x2 - x1,
+                    "bbox_h": y2 - y1,
+                    "confidence": det_score,
+                    "blur_score": blur,
+                    "is_low_quality": low_q,
+                    "raw_embedding": embedding.astype(np.float32).tobytes(),  # L2-normalized, norm≈1.0
+                    "face_crop": crop,
+                    "rotation": rotation,
+                }
+
+                # The same face as a kept (named/dismissed) row? Refresh that row
+                # instead of inserting a duplicate that would land in Review.
+                best_i, best_iou = -1, 0.0
+                for i, (_, kbox) in enumerate(unclaimed):
+                    score = _iou((x1, y1, x2, y2), kbox)
+                    if score > best_iou:
+                        best_i, best_iou = i, score
+                if best_iou >= REDETECT_MIN_IOU:
+                    obs_id, _ = unclaimed.pop(best_i)
+                    session.query(FaceObservation).filter(FaceObservation.id == obs_id).update(
+                        values, synchronize_session=False)
+                else:
+                    session.add(FaceObservation(id=str(uuid.uuid4()), photo_id=photo_id, **values))
 
             since_commit += 1
             if since_commit >= COMMIT_BATCH:
@@ -277,18 +422,22 @@ def run_face_pipeline(trip_id: str) -> None:
                     processed=idx + 1,
                     faces_found=faces_found,
                     group_photos=group_photo_count,
-                    low_quality=low_quality_count)
+                    low_quality=low_quality_count,
+                    sideways=sideways_count,
+                    uprighted=uprighted_count)
 
         session.commit()
 
-        crud.update_trip_status(session, trip_id, "faces_extracted")
+        crud.update_trip_status(session, trip_id, resume_status)
         _update(trip_id,
                 status="done",
                 total=total,
                 processed=total,
                 faces_found=faces_found,
                 group_photos=group_photo_count,
-                low_quality=low_quality_count)
+                low_quality=low_quality_count,
+                sideways=sideways_count,
+                uprighted=uprighted_count)
 
     except Exception as e:
         crud.fail_trip(session, trip_id, str(e))

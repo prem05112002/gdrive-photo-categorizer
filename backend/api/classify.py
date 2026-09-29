@@ -75,7 +75,8 @@ def get_results(trip_id: str, session: Session = Depends(get_session)):
             continue
         photo_count = (
             session.query(func.count(func.distinct(FaceObservation.photo_id)))
-            .filter(FaceObservation.person_id == tp.person_id)
+            .join(Photo, Photo.id == FaceObservation.photo_id)
+            .filter(Photo.trip_id == trip_id, FaceObservation.person_id == tp.person_id)
             .scalar()
         ) or 0
         persons.append({"name": person.name, "person_id": person.id, "photo_count": photo_count})

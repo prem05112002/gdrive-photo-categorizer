@@ -337,6 +337,9 @@ def get_face_context(
             (fx1, fy1, fx1 + bw * out_scale, fy1 + bh * out_scale),
             radius=6, outline=(124, 110, 248), width=3,
         )
+        if face.rotation:
+            # pixels stored sideways with no EXIF tag — same turn as the stored crop
+            crop = crop.rotate(face.rotation, expand=True)
         buf = io.BytesIO()
         crop.save(buf, format="JPEG", quality=85)
 
